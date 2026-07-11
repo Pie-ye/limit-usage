@@ -1,0 +1,210 @@
+:root {
+  --bg: #0f1419;
+  --card: #1a2332;
+  --border: #2d3a4d;
+  --text: #e7ecf3;
+  --muted: #8b9bb4;
+  --ok: #3dd68c;
+  --warn: #f5a524;
+  --bad: #f31260;
+  --info: #66b3ff;
+  --bar-bg: #0b1018;
+  --accent: #7c9cff;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(1200px 600px at 10% -10%, #1b2740 0%, var(--bg) 55%);
+  color: var(--text);
+  padding: 1.5rem;
+}
+
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+  align-items: flex-start;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.6rem;
+  letter-spacing: 0.02em;
+}
+
+.sub {
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.actions {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.meta {
+  font-size: 0.85rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+button {
+  background: linear-gradient(180deg, #4d6fff, #3a56d4);
+  color: white;
+  border: none;
+  border-radius: 10px;
+  padding: 0.65rem 1.1rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 6px 16px rgba(58, 86, 212, 0.35);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+button:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.msg {
+  color: var(--warn);
+  min-height: 1.2em;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1rem;
+}
+
+.card {
+  background: linear-gradient(160deg, rgba(255,255,255,0.03), transparent 40%), var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 1.15rem 1.2rem 1.25rem;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+}
+
+.card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+  margin-bottom: 0.85rem;
+}
+
+.card-head h2 {
+  margin: 0;
+  font-size: 1.2rem;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin-top: 0.2rem;
+}
+
+.badge {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.28rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.badge.ok { color: var(--ok); border-color: rgba(61, 214, 140, 0.4); background: rgba(61,214,140,0.08); }
+.badge.auth_error, .badge.error { color: var(--bad); border-color: rgba(243,18,96,0.4); background: rgba(243,18,96,0.08); }
+.badge.rate_limited, .badge.unsupported { color: var(--warn); border-color: rgba(245,165,36,0.4); background: rgba(245,165,36,0.08); }
+
+.message {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin: 0 0 0.85rem;
+  line-height: 1.4;
+}
+
+.window {
+  margin-top: 0.9rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+
+.window-title {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.9rem;
+  margin-bottom: 0.4rem;
+}
+
+.window-title .label { font-weight: 600; }
+.window-title .pct { color: var(--info); font-variant-numeric: tabular-nums; }
+
+.bar {
+  height: 10px;
+  background: var(--bar-bg);
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,0.06);
+}
+
+.bar > span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #3dd68c, #66b3ff);
+  width: 0%;
+  transition: width 0.4s ease;
+}
+
+.bar.low > span { background: linear-gradient(90deg, #f5a524, #f31260); }
+
+.countdown {
+  margin-top: 0.4rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.countdown strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.balance-line {
+  font-size: 1.35rem;
+  font-weight: 700;
+  margin: 0.2rem 0;
+}
+
+.balance-sub {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.loading {
+  color: var(--muted);
+}
+
+footer {
+  margin-top: 2rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+code {
+  background: rgba(255,255,255,0.06);
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+}

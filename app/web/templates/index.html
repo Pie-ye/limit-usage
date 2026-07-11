@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>limit-usage · AI 額度儀表板</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>limit-usage</h1>
+      <p class="sub">Codex · SuperGrok · DeepSeek · port {{ port }} · v{{ version }}</p>
+    </div>
+    <div class="actions">
+      <button id="refresh-btn" type="button">立即刷新</button>
+      <div class="meta">
+        <div>伺服器時間：<span id="server-time">—</span></div>
+        <div>下次輪詢：<span id="next-poll">—</span></div>
+        <div id="refresh-msg" class="msg"></div>
+      </div>
+    </div>
+  </header>
+
+  <main id="cards" class="cards">
+    <p class="loading">載入中…</p>
+  </main>
+
+  <footer>
+    <p>倒數依 <code>resets_at</code> 計算；DeepSeek 為餘額、無週期重置。密鑰請用環境變數或掛載 auth 檔。</p>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

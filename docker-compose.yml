@@ -1,0 +1,20 @@
+services:
+  limit-usage:
+    build: .
+    ports:
+      - "50048:50048"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "50048"
+      POLL_INTERVAL_SECONDS: "60"
+      DATABASE_PATH: "/app/data/usage.db"
+      CODEX_AUTH_PATH: "/secrets/codex/auth.json"
+      GROK_AUTH_PATH: "/secrets/grok/auth.json"
+      # DEEPSEEK_API_KEY: "sk-..."
+      # SUPERGROK_COOKIE: "..."
+    volumes:
+      - ./data:/app/data
+      # Mount host auth files (read-only)
+      - ${HOME}/.codex/auth.json:/secrets/codex/auth.json:ro
+      - ${HOME}/.grok/auth.json:/secrets/grok/auth.json:ro
+    restart: unless-stopped
