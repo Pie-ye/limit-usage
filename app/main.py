@@ -130,8 +130,29 @@ def create_app() -> FastAPI:
                     status_code=404, detail=f"Unknown provider: {provider}"
                 ) from exc
         repo: Repository = request.app.state.repository
-        rows = repo.get_history(provider=provider, limit=min(max(limit, 1), 500))
+        rows = repo.get_history(provider=provider, limit=min(max(limit, 1), 20000))
         return {"items": rows, "count": len(rows)}
+
+    @api.get("/trends")
+    async def trends(request: Request, days: int = 7):
+        from datetime import timedelta
+
+        from app.models import utcnow
+        from app.services.analytics import build_trends_payload
+
+        days = max(1, min(days, 30))
+        repo: Repository = request.app.state.repository
+        poller: UsagePoller = request.app.state.poller
+        since = utcnow() - timedelta(days=days)
+        snaps = poller.get_snapshots()
+        history_by: dict = {}
+        for s in snaps:
+            history_by[s.provider.value] = repo.get_history(
+                provider=s.provider.value,
+                limit=20000,
+                since=since,
+            )
+        return build_trends_payload(history_by, snaps, days=days)
 
     @api.get("/providers")
     async def providers_list(request: Request):
@@ -145,6 +166,21 @@ def create_app() -> FastAPI:
                 for p in poller.providers
             ]
         }
+
+    @api.get("/homepage")
+    async def homepage_flat(request: Request):
+        """Flat quota summary for gethomepage customapi (no nested arrays)."""
+        from app.services.homepage_view import build_homepage_payload
+
+        poller: UsagePoller = request.app.state.poller
+        return build_homepage_payload(poller.get_snapshots())
+
+    @api.get("/host/ups")
+    async def host_ups():
+        """UPS status via upower (limit-usage must run on the host)."""
+        from app.services.ups import read_ups
+
+        return read_ups()
 
     app.include_router(api)
 

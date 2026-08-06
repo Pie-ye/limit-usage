@@ -11,42 +11,33 @@ BALANCE_URL = "https://api.deepseek.com/user/balance"
 
 
 def parse_balance_payload(data: dict[str, Any]) -> list[UsageWindow]:
+    """Parse DeepSeek balance; only keep CNY (USD intentionally dropped)."""
     windows: list[UsageWindow] = []
     infos = data.get("balance_infos") or data.get("balanceInfos") or []
     if not isinstance(infos, list):
         infos = []
 
-    # Prefer USD then CNY then first
-    def sort_key(item: dict[str, Any]) -> int:
-        cur = str(item.get("currency") or "").upper()
-        if cur == "USD":
-            return 0
-        if cur == "CNY":
-            return 1
-        return 2
-
-    infos_sorted = sorted(
-        [i for i in infos if isinstance(i, dict)],
-        key=sort_key,
-    )
-
-    for info in infos_sorted:
-        currency = str(info.get("currency") or "")
+    cny_infos = [
+        i
+        for i in infos
+        if isinstance(i, dict) and str(i.get("currency") or "").upper() == "CNY"
+    ]
+    # Fallback: if API only returns non-CNY, still show nothing rather than USD
+    for info in cny_infos:
         total = str(info.get("total_balance") or info.get("totalBalance") or "0")
         granted = str(info.get("granted_balance") or info.get("grantedBalance") or "0")
         topped = str(
             info.get("topped_up_balance") or info.get("toppedUpBalance") or "0"
         )
-        key = f"balance-{currency.lower()}" if currency else "balance"
         windows.append(
             UsageWindow(
-                key=key,
-                label=f"Balance ({currency})" if currency else "Balance",
+                key="balance-cny",
+                label="Balance (CNY)",
                 used_percent=None,
                 remaining_percent=None,
                 resets_at=None,
                 amount=total,
-                currency=currency or None,
+                currency="CNY",
                 raw_extra={
                     "total_balance": total,
                     "granted_balance": granted,
@@ -58,9 +49,10 @@ def parse_balance_payload(data: dict[str, Any]) -> list[UsageWindow]:
     if not windows:
         windows.append(
             UsageWindow(
-                key="balance",
-                label="Balance",
+                key="balance-cny",
+                label="Balance (CNY)",
                 amount="0",
+                currency="CNY",
                 raw_extra={"is_available": data.get("is_available")},
             )
         )

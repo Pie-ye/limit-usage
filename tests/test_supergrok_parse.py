@@ -48,3 +48,26 @@ def test_parse_grok_credits_protobuf_fixture():
     assert main.resets_at is not None
     assert main.resets_at.astimezone(timezone.utc).day == 18
     assert any(w.key.startswith("product-") for w in windows)
+
+
+def test_parse_grok_credits_protobuf_zero_usage_omitted_fixture():
+    # Live response immediately after reset. Proto3 omits the zero-valued
+    # credit_usage_percent field, but the valid billing period remains.
+    raw = bytes.fromhex(
+        "0000000048"
+        "0a4612001a00220c08c99eedd20610b8ecfdb602"
+        "2a0c08c99392d30610b8ecfdb602"
+        "421e0802120c08c99eedd20610b8ecfdb602"
+        "1a0c08c99392d30610b8ecfdb602"
+        "580162006801"
+        "800000000f677270632d7374617475733a300d0a"
+    )
+    windows = parse_grok_credits_protobuf(raw)
+    assert len(windows) == 1
+    main = windows[0]
+    assert main.key == "weekly"
+    assert main.label == "Weekly"
+    assert main.used_percent == 0.0
+    assert main.remaining_percent == 100.0
+    assert main.resets_at is not None
+    assert main.resets_at.astimezone(timezone.utc).day == 25

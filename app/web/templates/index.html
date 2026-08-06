@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>limit-usage · AI 額度儀表板</title>
   <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
 </head>
 <body>
   <header class="top">
@@ -26,8 +27,20 @@
     <p class="loading">載入中…</p>
   </main>
 
+  <section class="trends-section">
+    <div class="trends-head">
+      <h2>7 日趨勢與剩餘工作量估算</h2>
+      <p class="hint">依歷史輪詢資料計算消耗速率（非官方任務計數）。樣本少時估算會不準。</p>
+    </div>
+    <div id="trends" class="trends">
+      <p class="loading">載入趨勢…</p>
+    </div>
+  </section>
+
   <footer>
-    <p>倒數依 <code>resets_at</code> 計算；DeepSeek 為餘額、無週期重置。密鑰請用環境變數或掛載 auth 檔。</p>
+    <p>
+      紅字粗體：僅 Weekly 額度偏低／將重置，或 DeepSeek CNY &lt; 10。5h 不提醒；DeepSeek 只顯示 CNY。
+    </p>
   </footer>
 
   <script src="/static/app.js"></script>

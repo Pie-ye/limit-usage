@@ -2,7 +2,8 @@ services:
   limit-usage:
     build: .
     ports:
-      - "50048:50048"
+      # host loopback only if you ever run via compose (production uses user systemd)
+      - "127.0.0.1:50048:50048"
     environment:
       HOST: "0.0.0.0"
       PORT: "50048"
@@ -14,7 +15,7 @@ services:
       # SUPERGROK_COOKIE: "..."
     volumes:
       - ./data:/app/data
-      # Mount host auth files (read-only)
+      # Codex is read-only; Grok is writable so rotated OIDC tokens persist.
       - ${HOME}/.codex/auth.json:/secrets/codex/auth.json:ro
-      - ${HOME}/.grok/auth.json:/secrets/grok/auth.json:ro
+      - ${HOME}/.grok/auth.json:/secrets/grok/auth.json:rw
     restart: unless-stopped

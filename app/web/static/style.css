@@ -193,8 +193,113 @@ button:hover:not(:disabled) {
   color: var(--muted);
 }
 
+/* Urgency: bold red when low quota or reset soon */
+.urgent-low,
+.urgent-critical {
+  color: var(--bad) !important;
+  font-weight: 800 !important;
+}
+
+.urgent-critical {
+  text-shadow: 0 0 12px rgba(243, 18, 96, 0.35);
+  animation: pulse-urgent 1.6s ease-in-out infinite;
+}
+
+.window.urgent-low,
+.window.urgent-critical {
+  border-left: 3px solid var(--bad);
+  padding-left: 0.65rem;
+  margin-left: -0.15rem;
+}
+
+.urgency-banner {
+  margin: 0.5rem 0 0.75rem;
+  padding: 0.45rem 0.65rem;
+  border-radius: 8px;
+  background: rgba(243, 18, 96, 0.12);
+  border: 1px solid rgba(243, 18, 96, 0.35);
+  color: var(--bad);
+  font-weight: 800;
+  font-size: 0.9rem;
+}
+
+@keyframes pulse-urgent {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.72; }
+}
+
 .loading {
   color: var(--muted);
+}
+
+.trends-section {
+  margin-top: 2rem;
+}
+
+.trends-head h2 {
+  margin: 0 0 0.35rem;
+  font-size: 1.25rem;
+}
+
+.trends {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.trend-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 1rem 1.1rem 1.15rem;
+}
+
+.trend-card h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1.05rem;
+}
+
+.estimate-box {
+  margin-top: 0.65rem;
+  font-size: 0.88rem;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.estimate-box .estimate-main {
+  color: var(--text);
+  font-weight: 700;
+  font-size: 0.95rem;
+  margin-bottom: 0.25rem;
+}
+
+.estimate-box .estimate-main.urgent-low,
+.estimate-box .estimate-main.urgent-critical {
+  color: var(--bad);
+}
+
+.estimate-tasks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.4rem 0;
+}
+
+.estimate-tasks span {
+  background: rgba(255,255,255,0.06);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.78rem;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-wrap {
+  position: relative;
+  height: 180px;
+  margin-top: 0.5rem;
 }
 
 footer {

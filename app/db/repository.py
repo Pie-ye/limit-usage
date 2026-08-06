@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime  # noqa: TC003 — used at runtime in get_history
 from pathlib import Path
 from typing import Any
 
@@ -88,10 +88,22 @@ class Repository:
         self,
         provider: ProviderId | str | None = None,
         limit: int = 50,
+        *,
+        since: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        limit = max(1, min(limit, 500))
+        limit = max(1, min(limit, 20000))
         with self._connect() as conn:
-            if provider:
+            if provider and since:
+                key = provider.value if isinstance(provider, ProviderId) else provider
+                rows = conn.execute(
+                    """
+                    SELECT provider, payload, fetched_at FROM usage_history
+                    WHERE provider = ? AND fetched_at >= ?
+                    ORDER BY id ASC LIMIT ?
+                    """,
+                    (key, since.isoformat(), limit),
+                ).fetchall()
+            elif provider:
                 key = provider.value if isinstance(provider, ProviderId) else provider
                 rows = conn.execute(
                     """
@@ -101,6 +113,16 @@ class Repository:
                     """,
                     (key, limit),
                 ).fetchall()
+                rows = list(reversed(rows))
+            elif since:
+                rows = conn.execute(
+                    """
+                    SELECT provider, payload, fetched_at FROM usage_history
+                    WHERE fetched_at >= ?
+                    ORDER BY id ASC LIMIT ?
+                    """,
+                    (since.isoformat(), limit),
+                ).fetchall()
             else:
                 rows = conn.execute(
                     """
@@ -109,6 +131,7 @@ class Repository:
                     """,
                     (limit,),
                 ).fetchall()
+                rows = list(reversed(rows))
         result: list[dict[str, Any]] = []
         for row in rows:
             result.append(

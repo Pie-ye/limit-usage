@@ -1,0 +1,21 @@
+[Unit]
+Description=limit-usage AI quota API (127.0.0.1:50048, internal)
+Documentation=https://github.com/Pie-ye/limit-usage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pieye/Container/limit-usage
+# Load DEEPSEEK_API_KEY and other settings; '-' means optional if missing
+EnvironmentFile=-/home/pieye/Container/limit-usage/.env
+Environment=PYTHONUNBUFFERED=1
+# Bind loopback only — not a public/LAN website; homepage proxies via 127.0.0.1
+ExecStart=/home/pieye/Container/limit-usage/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 50048
+Restart=always
+RestartSec=5
+# Soft hardening
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

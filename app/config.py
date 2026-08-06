@@ -20,7 +20,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 50048
     poll_interval_seconds: int = Field(default=60, ge=15)
     database_path: str = "./data/usage.db"
