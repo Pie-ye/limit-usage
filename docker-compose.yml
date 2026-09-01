@@ -7,9 +7,6 @@ services:
     build: .
     image: limit-usage:local
     container_name: limit-usage
-    env_file:
-      - path: .env
-        required: false
     ports:
       - "127.0.0.1:50048:50048"
     environment:
