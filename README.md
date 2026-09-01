@@ -23,30 +23,28 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 50048
 
 Open http://localhost:50048
 
-## Permanent run + start on boot (systemd user)
+## Production run (Docker — preferred)
 
 ```bash
-# once: venv + .env ready
-./deploy/install-user-service.sh
-```
+# stop legacy user unit if still present
+systemctl --user disable --now limit-usage.service 2>/dev/null || true
 
-This installs `~/.config/systemd/user/limit-usage.service`, enables it, and starts it now.
-Your account already uses `loginctl linger` so the service comes up after reboot without logging in.
-
-```bash
-systemctl --user status limit-usage
-systemctl --user restart limit-usage
-journalctl --user -u limit-usage -f
-```
-
-### Docker (alternative)
-
-```bash
 docker compose up --build -d
+docker compose ps
+curl -sS http://127.0.0.1:50048/api/health
 ```
 
-`restart: unless-stopped` keeps the container up; enable Docker itself on boot (`systemctl enable docker`).
-Mounts `~/.codex/auth.json` and `~/.grok/auth.json` read-only. Set `DEEPSEEK_API_KEY` in compose or env.
+- Listens on **127.0.0.1:50048** (homepage widgets / edge proxy unchanged).
+- Mounts `./data`, `~/.codex/auth.json` (ro), `~/.grok/auth.json` (rw for token rotation).
+- Mounts host D-Bus + `apparmor:unconfined` so `/api/host/ups` can talk to host upowerd.
+- `restart: unless-stopped`; ensure `docker` is enabled on boot.
+
+### Legacy systemd user unit
+
+```bash
+./deploy/install-user-service.sh   # only if not using Docker
+systemctl --user status limit-usage
+```
 
 ## Configuration
 

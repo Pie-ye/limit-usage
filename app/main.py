@@ -182,6 +182,27 @@ def create_app() -> FastAPI:
 
         return read_ups()
 
+    @api.get("/card-spend")
+    async def card_spend():
+        """Cathay monthly card total (flat JSON for dashboard + homepage customapi)."""
+        from app.services.card_spend import read_card_spend
+
+        return read_card_spend()
+
+    @api.get("/concerts")
+    async def concerts():
+        """Taiwan concert-watch cache (flat JSON for dashboard + homepage customapi)."""
+        from app.services.concerts import read_concerts
+
+        return read_concerts()
+
+    @api.get("/system/health")
+    async def system_health():
+        """Three-host system health and backup status."""
+        from app.services.system_health import read_system_health
+
+        return read_system_health()
+
     app.include_router(api)
 
     static_dir = WEB_DIR / "static"

@@ -55,6 +55,8 @@ def test_build_homepage_payload_weekly_and_cny():
         ),
     ]
     out = build_homepage_payload(snaps, now=datetime(2026, 8, 1, 5, 0, tzinfo=timezone.utc))
+    assert out["codex_5h_used_percent"] == 10.0
+    assert out["codex_5h_remaining_percent"] == 90.0
     assert out["codex_weekly_used_percent"] == 12.5
     assert out["codex_weekly_remaining_percent"] == 87.5
     assert out["codex_status"] == "ok"

@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     grok_auth_path: str = "~/.grok/auth.json"
     supergrok_cookie: str | None = None
     deepseek_api_key: str | None = None
+    antigravity_token_path: str = "~/.gemini/antigravity-acp/acp_token.json"
 
     http_timeout_seconds: float = 20.0
     max_backoff_seconds: int = 900
@@ -48,6 +49,10 @@ class Settings(BaseSettings):
     @property
     def grok_auth(self) -> Path:
         return expand_path(self.grok_auth_path) or Path.home() / ".grok" / "auth.json"
+
+    @property
+    def antigravity_token(self) -> Path:
+        return expand_path(self.antigravity_token_path) or Path.home() / ".gemini" / "antigravity-acp" / "acp_token.json"
 
 
 @lru_cache

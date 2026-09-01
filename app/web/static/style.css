@@ -313,3 +313,13 @@ code {
   padding: 0.1rem 0.35rem;
   border-radius: 4px;
 }
+
+
+/* Cathay monthly card-spend */
+.card-spend .balance-line {
+  font-size: 1.85rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  font-variant-numeric: tabular-nums;
+  color: #7dffa8;
+}

@@ -269,9 +269,15 @@ def compute_burn_estimate(
 def _is_weekly_window(window: dict[str, Any]) -> bool:
     key = str(window.get("key") or "").lower()
     label = str(window.get("label") or "").lower()
-    if key in {"1w", "weekly"} or key.startswith("1w"):
+    if (
+        key in {"1w", "weekly"}
+        or key.startswith("1w")
+        or key.endswith("-1w")
+        or key.endswith("-weekly")
+        or "weekly" in key
+    ):
         return True
-    if "week" in label:
+    if "week" in label or "週" in label:
         return True
     # SuperGrok usage pool labeled Weekly via reset span
     limit_s = window.get("limit_window_seconds")

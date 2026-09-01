@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.config import Settings
+from app.providers.antigravity import AntigravityProvider
 from app.providers.base import UsageProvider
 from app.providers.codex import CodexProvider
 from app.providers.deepseek import DeepSeekProvider
@@ -17,4 +18,5 @@ def build_providers(settings: Settings) -> list[UsageProvider]:
             timeout=timeout,
         ),
         DeepSeekProvider(settings.deepseek_api_key, timeout=timeout),
+        AntigravityProvider(settings.antigravity_token, timeout=timeout),
     ]

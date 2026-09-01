@@ -167,7 +167,36 @@
       </div>`;
   }
 
-  function renderCards(data) {
+
+  function renderCardSpend(card) {
+    if (!card) return "";
+    const status = card.status || (card.ok ? "ok" : "error");
+    const month = card.month ? escapeHtml(card.month) : "—";
+    const total = escapeHtml(card.month_total_display || "—");
+    const updated = fmtTime(parseIso(card.updated_at));
+    const msg = card.message ? `<p class="message">${escapeHtml(card.message)}</p>` : "";
+    return `
+      <article class="card card-spend" data-provider="card-spend">
+        <div class="card-head">
+          <div>
+            <h2>${escapeHtml(card.display_name || "本月刷卡")}</h2>
+            <div class="hint">國泰當月消費總額 · ${month}${card.source ? " · " + escapeHtml(card.source) : ""}</div>
+          </div>
+          ${statusBadge(status)}
+        </div>
+        ${msg}
+        <div class="window">
+          <div class="window-title">
+            <span class="label">本月總額</span>
+            <span class="pct">${escapeHtml(card.currency || "TWD")}</span>
+          </div>
+          <div class="balance-line">${total}</div>
+          <div class="countdown">更新：${updated}</div>
+        </div>
+      </article>`;
+  }
+
+  function renderCards(data, cardSpend) {
     latest = data;
     serverTimeEl.textContent = fmtTime(parseIso(data.server_time));
 
@@ -184,7 +213,7 @@
       return;
     }
 
-    cardsEl.innerHTML = snaps
+    const providerHtml = snaps
       .map((s) => {
         const wins = (s.windows || []).filter((w) => {
           // Hide DeepSeek USD (and any non-CNY balance)
@@ -212,6 +241,7 @@
           </article>`;
       })
       .join("");
+    cardsEl.innerHTML = providerHtml + renderCardSpend(cardSpend);
   }
 
   function fmtHours(h) {
@@ -390,10 +420,17 @@
 
   async function loadUsage() {
     try {
-      const res = await fetch("/api/usage", { cache: "no-store" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      renderCards(data);
+      const [usageRes, spendRes] = await Promise.all([
+        fetch("/api/usage", { cache: "no-store" }),
+        fetch("/api/card-spend", { cache: "no-store" }),
+      ]);
+      if (!usageRes.ok) throw new Error(`HTTP ${usageRes.status}`);
+      const data = await usageRes.json();
+      let cardSpend = null;
+      if (spendRes.ok) {
+        cardSpend = await spendRes.json();
+      }
+      renderCards(data, cardSpend);
       refreshMsg.textContent = "";
     } catch (err) {
       refreshMsg.textContent = `載入失敗：${err.message}`;
