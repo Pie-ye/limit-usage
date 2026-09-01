@@ -72,6 +72,38 @@ See `.env.example`.
 - `POST /api/refresh` — force poll (rate-limited)
 - `GET /api/history?provider=&limit=`
 - `GET /api/trends?days=7` — 7-day series + burn-rate work estimates
+- `GET /api/system/health` — companion endpoint for Homepage system health and backup freshness
+
+## System Health and Backup Status Truth
+
+The `/api/system/health` endpoint reports system health and backup freshness based on three independent sources of truth:
+
+| Fact | Truth source | Freshness meaning |
+|---|---|---|
+| Local rsync | latest valid snapshot directory name | snapshot created within 26 hours |
+| Offsite schedule | scripts/three_host/deployment-status.json | acceptance-gated means disabled, not failed or healthy |
+| Health verification | latest health-*.json filename | checks executed within 26 hours |
+
+State explicitly: `restic-repository: ok` means the repository was readable at report time, not that a current daily snapshot exists.
+
+In `scripts/three_host/deployment-status.json`, schedule state is recorded as `acceptance-gated`, mapped to `restic_status: "disabled"` and `restic_display: "尚未啟用"`.
+
+### Read-only Mount and Deployment Manifest
+
+The deployment status manifest is mounted into the container via a single-file read-only mount:
+`${HOME}/Container/scripts/three_host/deployment-status.json:/secrets/three-host-deployment-status.json:ro`
+
+### API Fields and Aliases
+
+- Independent fields: `rsync_status`, `rsync_display`, `rsync_stale`, `restic_status`, `restic_display`, `verification_status`, `verification_display`, `verification_updated_at`.
+- Backward aliases: `stale` (tracks `verification_stale`), `freshness_display` (tracks `verification_display`), `updated_at` (tracks `verification_updated_at`), `expires_at`, `age_seconds`.
+
+### Future Enablement Gate
+
+Enabling the timers requires all of the following in one coordinated change:
+`/home/pieye/Data` map-or-waive, strict full backup/check/isolated restore acceptance, installed/repository unit alignment, new snapshot-recency evidence, manifest/schema update, and `systemctl --user is-enabled` parity verification.
+
+Explicitly note: this task does not run or enable either timer (`three-host-offsite-backup.timer` and `three-host-health.timer` remain disabled and inactive).
 
 ## Dashboard features
 
