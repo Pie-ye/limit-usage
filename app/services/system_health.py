@@ -27,6 +27,7 @@ EXPECTED_SCHEDULES = {
     "health_verification": ("three-host-health.timer", "acceptance-gated"),
 }
 STALE_AFTER_SECONDS = 93600  # 26 hours
+WEEKLY_STALE_AFTER_SECONDS = 604800  # 7 days
 TAIPEI = timezone(timedelta(hours=8))
 SNAPSHOT_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
 HEALTH_PATTERN = re.compile(r"^health-(\d{8}T\d{12}Z)\.json$")
@@ -275,6 +276,153 @@ def _read_verification_fact(state_dir: Path, now_dt: datetime) -> dict[str, Any]
     }
 
 
+def _fmt_taipei(iso_utc: str | None) -> str:
+    if not iso_utc:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso_utc.replace("Z", "+00:00"))
+    except ValueError:
+        return "—"
+    return dt.astimezone(TAIPEI).strftime("%m/%d %H:%M")
+
+
+def _read_weekly_verification(state_dir: Path, now_dt: datetime) -> dict[str, Any]:
+    unknown = {
+        "stale": False,
+        "timeshift_status": "unknown",
+        "timeshift_display": "—",
+        "retire_timer_status": "unknown",
+        "retire_timer_display": "—",
+        "rsync_continuity_status": "unknown",
+        "rsync_continuity_display": "—",
+    }
+    path = state_dir / "weekly-verification.json"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return unknown
+    if not isinstance(document, dict) or document.get("schema_version") != 1:
+        return unknown
+
+    result = dict(unknown)
+    stale = True
+    updated_at = document.get("updated_at")
+    if isinstance(updated_at, str):
+        try:
+            updated_dt = datetime.fromisoformat(updated_at)
+            if updated_dt.tzinfo is None:
+                updated_dt = updated_dt.replace(tzinfo=TAIPEI)
+            stale = (
+                (now_dt - updated_dt.astimezone(timezone.utc)).total_seconds()
+                > WEEKLY_STALE_AFTER_SECONDS
+            )
+        except ValueError:
+            stale = True
+    result["stale"] = stale
+
+    for key, status_key, display_key in (
+        ("timeshift", "timeshift_status", "timeshift_display"),
+        ("retire_timer", "retire_timer_status", "retire_timer_display"),
+        ("rsync_continuity", "rsync_continuity_status", "rsync_continuity_display"),
+    ):
+        entry = document.get(key)
+        if not isinstance(entry, dict) or not isinstance(entry.get("status"), str):
+            continue
+        status = entry["status"]
+        if status not in {"ok", "warn", "error", "unknown", "disabled"}:
+            continue
+        display = str(entry.get("display") or "").strip()
+        result[status_key] = status
+        result[display_key] = display or "—"
+    return result
+
+
+def _build_daily_weekly_displays(
+    payload: dict[str, Any], weekly: dict[str, Any]
+) -> dict[str, str]:
+    # 每日 · rsync 快照
+    if payload["rsync_status"] == "ok":
+        daily_rsync = f"✓ {payload['rsync_display']}"
+    elif payload["rsync_status"] == "stale":
+        daily_rsync = f"✗ {payload['rsync_display']}"
+    else:
+        daily_rsync = "— 狀態未知"
+
+    # 每日 · 驗證證據
+    evidence_time = _fmt_taipei(payload["verification_updated_at"])
+    if payload["verification_status"] == "ok":
+        daily_evidence = f"✓ {evidence_time}"
+    elif payload["verification_status"] == "warn":
+        daily_evidence = f"⚠ {payload['checks_display']}（{evidence_time}）"
+    elif payload["verification_status"] == "stale":
+        if payload["health_schedule_status"] == "disabled":
+            daily_evidence = f"⚠ 排程未啟用（最後 {evidence_time}）"
+        else:
+            daily_evidence = f"✗ 已過期（{evidence_time}）"
+    else:
+        daily_evidence = "— 無證據"
+
+    # 每日 · 備份 timer（rsync 取自健康證據，retire 取自每週檔案）
+    if payload["verification_status"] in {"ok", "warn"}:
+        rsync_check = next(
+            (c for c in payload["checks"] if c.get("name") == "rsync-timer"), None
+        )
+        if rsync_check is not None:
+            rsync_timer_part = "rsync ✓" if rsync_check.get("ok") else "rsync ✗"
+        else:
+            rsync_timer_part = "rsync —（無此檢查）"
+    else:
+        rsync_timer_part = "rsync —（證據過期）"
+    if weekly["stale"]:
+        retire_part = "retire —（資料過期）"
+    elif weekly["retire_timer_status"] == "ok":
+        retire_part = "retire ✓"
+    elif weekly["retire_timer_status"] in {"warn", "error"}:
+        retire_part = "retire ✗"
+    else:
+        retire_part = "retire —"
+    daily_timer = f"{rsync_timer_part} · {retire_part}"
+
+    # 每日 · 7 天連續
+    if weekly["stale"]:
+        daily_continuity = "⚠ 資料過期（待每週檢查更新）"
+    elif weekly["rsync_continuity_status"] == "ok":
+        daily_continuity = "✓ 過去 7 天連續"
+    elif weekly["rsync_continuity_status"] in {"warn", "error"}:
+        daily_continuity = f"✗ {weekly['rsync_continuity_display']}"
+    else:
+        daily_continuity = "— 無資料（待每週檢查更新）"
+
+    # 每週 · Timeshift
+    if weekly["stale"]:
+        weekly_timeshift = "⚠ 資料過期（待每週檢查更新）"
+    elif weekly["timeshift_status"] == "ok":
+        weekly_timeshift = f"✓ {weekly['timeshift_display']}"
+    elif weekly["timeshift_status"] in {"warn", "error"}:
+        weekly_timeshift = f"✗ {weekly['timeshift_display']}"
+    elif weekly["timeshift_display"] != "—":
+        weekly_timeshift = f"— {weekly['timeshift_display']}"
+    else:
+        weekly_timeshift = "— 無資料（待每週檢查更新）"
+
+    # 每週 · Restic 異地
+    if payload["restic_status"] == "disabled":
+        weekly_restic = "⚠ 尚未啟用"
+    elif payload["restic_status"] == "ok":
+        weekly_restic = "✓ 排程正常"
+    else:
+        weekly_restic = "✗ 狀態未知"
+
+    return {
+        "daily_rsync": daily_rsync,
+        "daily_evidence": daily_evidence,
+        "daily_timer": daily_timer,
+        "daily_continuity": daily_continuity,
+        "weekly_timeshift": weekly_timeshift,
+        "weekly_restic": weekly_restic,
+    }
+
+
 def read_system_health(
     state_dir_override: Path | None = None,
     rsync_dir_override: Path | None = None,
@@ -299,6 +447,11 @@ def read_system_health(
     payload.update(_read_rsync_fact(rsync_dir, now_dt))
     payload.update(_read_deployment_status(deployment_path))
     payload.update(_read_verification_fact(state_dir, now_dt))
+    payload.update(
+        _build_daily_weekly_displays(
+            payload, _read_weekly_verification(state_dir, now_dt)
+        )
+    )
 
     required_statuses = (
         payload["rsync_status"],

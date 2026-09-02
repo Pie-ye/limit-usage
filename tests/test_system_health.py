@@ -40,6 +40,12 @@ COMMON_FIELDS = (
     "verification_status",
     "verification_display",
     "verification_updated_at",
+    "daily_rsync",
+    "daily_evidence",
+    "daily_timer",
+    "daily_continuity",
+    "weekly_timeshift",
+    "weekly_restic",
 )
 
 
@@ -63,6 +69,35 @@ class SystemHealthEnv:
     def make_snapshot(self, stamp: str) -> Path:
         path = self.rsync / stamp
         path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def write_weekly(
+        self,
+        *,
+        updated_at: str = "2026-08-31T05:00:00+08:00",
+        timeshift_status: str = "ok",
+        timeshift_display: str = "3 天前",
+        retire_status: str = "ok",
+        retire_display: str = "運行中",
+        continuity_status: str = "ok",
+        continuity_display: str = "過去 7 天連續",
+    ) -> Path:
+        path = self.state / "weekly-verification.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "updated_at": updated_at,
+                    "timeshift": {"status": timeshift_status, "display": timeshift_display},
+                    "retire_timer": {"status": retire_status, "display": retire_display},
+                    "rsync_continuity": {
+                        "status": continuity_status,
+                        "display": continuity_display,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         return path
 
     def read(self) -> dict[str, object]:
@@ -296,3 +331,65 @@ def test_parity_with_homepage_contract(tmp_path: Path) -> None:
     assert limit_data["stale_after_seconds"] == hp_data["stale_after_seconds"]
     assert limit_data["nas_disk_percent"] == hp_data["nas_disk_percent"]
     assert limit_data["oracle_disk_percent"] == hp_data["oracle_disk_percent"]
+
+
+def test_weekly_unknown_without_weekly_file(tmp_path: Path) -> None:
+    env = SystemHealthEnv(tmp_path)
+    env.make_snapshot("2026-09-01_03-35-00")
+    env.write_health("20260831T000000000000Z")  # stale evidence, acceptance-gated
+
+    data = env.read()
+
+    assert data["daily_rsync"] == "✓ 今日 03:35 成功"
+    assert data["daily_evidence"] == "⚠ 排程未啟用（最後 08/31 08:00）"
+    assert data["daily_timer"] == "rsync —（證據過期） · retire —"
+    assert data["daily_continuity"] == "— 無資料（待每週檢查更新）"
+    assert data["weekly_timeshift"] == "— 無資料（待每週檢查更新）"
+    assert data["weekly_restic"] == "⚠ 尚未啟用"
+
+
+def test_fresh_weekly_file_populates_fields(tmp_path: Path) -> None:
+    env = SystemHealthEnv(tmp_path)
+    env.make_snapshot("2026-09-01_03-35-00")
+    env.write_health("20260901T050000000000Z")
+    env.write_weekly()
+
+    data = env.read()
+
+    assert data["daily_rsync"] == "✓ 今日 03:35 成功"
+    assert data["daily_evidence"] == "✓ 09/01 13:00"
+    assert data["daily_timer"] == "rsync ✓ · retire ✓"
+    assert data["daily_continuity"] == "✓ 過去 7 天連續"
+    assert data["weekly_timeshift"] == "✓ 3 天前"
+    assert data["weekly_restic"] == "⚠ 尚未啟用"
+
+
+def test_stale_weekly_file_marks_expired(tmp_path: Path) -> None:
+    env = SystemHealthEnv(tmp_path)
+    env.make_snapshot("2026-09-01_03-35-00")
+    env.write_health("20260901T050000000000Z")
+    env.write_weekly(updated_at="2026-08-20T05:00:00+08:00")  # > 7 days old
+
+    data = env.read()
+
+    assert data["daily_continuity"] == "⚠ 資料過期（待每週檢查更新）"
+    assert data["weekly_timeshift"] == "⚠ 資料過期（待每週檢查更新）"
+    assert data["daily_timer"] == "rsync ✓ · retire —（資料過期）"
+
+
+def test_weekly_warn_timeshift_and_missing_days(tmp_path: Path) -> None:
+    env = SystemHealthEnv(tmp_path)
+    env.make_snapshot("2026-09-01_03-35-00")
+    env.write_health("20260901T050000000000Z")
+    env.write_weekly(
+        timeshift_status="warn",
+        timeshift_display="9 天前（超過 7 天）",
+        continuity_status="warn",
+        continuity_display="缺少 2 天（2026-08-29 2026-08-30）",
+    )
+
+    data = env.read()
+
+    assert data["weekly_timeshift"] == "✗ 9 天前（超過 7 天）"
+    assert data["daily_continuity"] == "✗ 缺少 2 天（2026-08-29 2026-08-30）"
+
