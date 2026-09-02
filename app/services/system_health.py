@@ -23,8 +23,17 @@ DEFAULT_DEPLOYMENT_STATUS_FILES = (
 )
 
 EXPECTED_SCHEDULES = {
-    "offsite_backup": ("three-host-offsite-backup.timer", "acceptance-gated"),
-    "health_verification": ("three-host-health.timer", "acceptance-gated"),
+    "offsite_backup": {
+        "kind": "systemd-timer",
+        "unit": "three-host-offsite-backup.timer",
+        "state": "acceptance-gated",
+    },
+    "health_verification": {
+        "kind": "n8n-workflow",
+        "workflow": "threeHostHealth01",
+        "cron": "15 5 * * *",
+        "state": "scheduled",
+    },
 }
 STALE_AFTER_SECONDS = 93600  # 26 hours
 WEEKLY_STALE_AFTER_SECONDS = 604800  # 7 days
@@ -124,24 +133,17 @@ def _read_deployment_status(path: Path) -> dict[str, str]:
     if (
         not isinstance(document, dict)
         or type(document.get("schema_version")) is not int
-        or document.get("schema_version") != 1
+        or document.get("schema_version") != 2
     ):
         return unknown
-    schedules = document.get("schedules")
-    if not isinstance(schedules, dict) or set(schedules) != set(EXPECTED_SCHEDULES):
+    if document.get("schedules") != EXPECTED_SCHEDULES:
         return unknown
-    for name, (expected_unit, expected_state) in EXPECTED_SCHEDULES.items():
-        entry = schedules.get(name)
-        if not isinstance(entry, dict) or set(entry) != {"unit", "state"}:
-            return unknown
-        if entry.get("unit") != expected_unit or entry.get("state") != expected_state:
-            return unknown
 
     return {
         "restic_status": "disabled",
         "restic_display": "尚未啟用",
-        "health_schedule_status": "disabled",
-        "health_schedule_display": "排程尚未啟用",
+        "health_schedule_status": "scheduled",
+        "health_schedule_display": "n8n 每日 05:15",
     }
 
 
@@ -355,10 +357,7 @@ def _build_daily_weekly_displays(
     elif payload["verification_status"] == "warn":
         daily_evidence = f"⚠ {payload['checks_display']}（{evidence_time}）"
     elif payload["verification_status"] == "stale":
-        if payload["health_schedule_status"] == "disabled":
-            daily_evidence = f"⚠ 排程未啟用（最後 {evidence_time}）"
-        else:
-            daily_evidence = f"✗ 已過期（{evidence_time}）"
+        daily_evidence = f"✗ 已過期（{evidence_time}）"
     else:
         daily_evidence = "— 無證據"
 

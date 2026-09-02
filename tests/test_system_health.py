@@ -10,15 +10,18 @@ from app.services import system_health
 
 NOW = datetime(2026, 9, 1, 6, 0, tzinfo=timezone.utc)  # 14:00 Asia/Taipei
 DEPLOYMENT_STATUS = {
-    "schema_version": 1,
+    "schema_version": 2,
     "schedules": {
         "offsite_backup": {
+            "kind": "systemd-timer",
             "unit": "three-host-offsite-backup.timer",
             "state": "acceptance-gated",
         },
         "health_verification": {
-            "unit": "three-host-health.timer",
-            "state": "acceptance-gated",
+            "kind": "n8n-workflow",
+            "workflow": "threeHostHealth01",
+            "cron": "15 5 * * *",
+            "state": "scheduled",
         },
     },
 }
@@ -169,7 +172,7 @@ def test_failed_check_warns_verification(tmp_path: Path) -> None:
     assert data["status"] == "warn"
 
 
-def test_restic_check_does_not_override_gated_deployment(tmp_path: Path) -> None:
+def test_restic_offsite_gated_while_health_scheduled(tmp_path: Path) -> None:
     env = SystemHealthEnv(tmp_path)
     env.make_snapshot("2026-09-01_03-35-00")
     env.write_health(
@@ -183,8 +186,8 @@ def test_restic_check_does_not_override_gated_deployment(tmp_path: Path) -> None
         assert field in data
     assert data["restic_status"] == "disabled"
     assert data["restic_display"] == "尚未啟用"
-    assert data["health_schedule_status"] == "disabled"
-    assert data["health_schedule_display"] == "排程尚未啟用"
+    assert data["health_schedule_status"] == "scheduled"
+    assert data["health_schedule_display"] == "n8n 每日 05:15"
     assert data["status"] == "warn"
 
 
@@ -198,12 +201,43 @@ def test_invalid_deployment_state_is_unknown_error(tmp_path: Path) -> None:
         "boolean-schema": json.dumps(
             {**DEPLOYMENT_STATUS, "schema_version": True}
         ),
-        "unknown": json.dumps(
+        "v1-doc": json.dumps(
             {
                 "schema_version": 1,
                 "schedules": {
+                    "offsite_backup": {
+                        "unit": "three-host-offsite-backup.timer",
+                        "state": "acceptance-gated",
+                    },
+                    "health_verification": {
+                        "unit": "three-host-health.timer",
+                        "state": "acceptance-gated",
+                    },
+                },
+            }
+        ),
+        "unknown": json.dumps(
+            {
+                "schema_version": 2,
+                "schedules": {
                     **DEPLOYMENT_STATUS["schedules"],
-                    "unexpected": {"unit": "surprise.timer", "state": "active"},
+                    "unexpected": {
+                        "kind": "systemd-timer",
+                        "unit": "surprise.timer",
+                        "state": "active",
+                    },
+                },
+            }
+        ),
+        "stale-health-entry": json.dumps(
+            {
+                "schema_version": 2,
+                "schedules": {
+                    "offsite_backup": DEPLOYMENT_STATUS["schedules"]["offsite_backup"],
+                    "health_verification": {
+                        **DEPLOYMENT_STATUS["schedules"]["health_verification"],
+                        "unit": "three-host-health.timer",
+                    },
                 },
             }
         ),
@@ -336,12 +370,12 @@ def test_parity_with_homepage_contract(tmp_path: Path) -> None:
 def test_weekly_unknown_without_weekly_file(tmp_path: Path) -> None:
     env = SystemHealthEnv(tmp_path)
     env.make_snapshot("2026-09-01_03-35-00")
-    env.write_health("20260831T000000000000Z")  # stale evidence, acceptance-gated
+    env.write_health("20260831T000000000000Z")  # stale despite scheduled health check
 
     data = env.read()
 
     assert data["daily_rsync"] == "✓ 今日 03:35 成功"
-    assert data["daily_evidence"] == "⚠ 排程未啟用（最後 08/31 08:00）"
+    assert data["daily_evidence"] == "✗ 已過期（08/31 08:00）"
     assert data["daily_timer"] == "rsync —（證據過期） · retire —"
     assert data["daily_continuity"] == "— 無資料（待每週檢查更新）"
     assert data["weekly_timeshift"] == "— 無資料（待每週檢查更新）"
