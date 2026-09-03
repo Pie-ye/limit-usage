@@ -51,6 +51,25 @@ def _window_metric(window: dict[str, Any]) -> tuple[str, float | None, float | N
     metric_kind: 'percent' | 'balance'
     """
     key = str(window.get("key") or "")
+    rem = window.get("remaining_percent")
+    used = window.get("used_percent")
+
+    # If explicit percentage fields exist, prefer percent metric
+    if rem is not None or used is not None:
+        try:
+            rem_f = float(rem) if rem is not None else None
+        except (TypeError, ValueError):
+            rem_f = None
+        try:
+            used_f = float(used) if used is not None else None
+        except (TypeError, ValueError):
+            used_f = None
+        if rem_f is None and used_f is not None:
+            rem_f = max(0.0, min(100.0, 100.0 - used_f))
+        if used_f is None and rem_f is not None:
+            used_f = max(0.0, min(100.0, 100.0 - rem_f))
+        return "percent", rem_f, used_f
+
     if key.startswith("balance") or window.get("amount") is not None:
         try:
             amount = float(window.get("amount") or 0)
@@ -58,21 +77,7 @@ def _window_metric(window: dict[str, Any]) -> tuple[str, float | None, float | N
             amount = None
         return "balance", amount, None
 
-    rem = window.get("remaining_percent")
-    used = window.get("used_percent")
-    try:
-        rem_f = float(rem) if rem is not None else None
-    except (TypeError, ValueError):
-        rem_f = None
-    try:
-        used_f = float(used) if used is not None else None
-    except (TypeError, ValueError):
-        used_f = None
-    if rem_f is None and used_f is not None:
-        rem_f = max(0.0, min(100.0, 100.0 - used_f))
-    if used_f is None and rem_f is not None:
-        used_f = max(0.0, min(100.0, 100.0 - rem_f))
-    return "percent", rem_f, used_f
+    return "percent", None, None
 
 
 def extract_series_points(

@@ -39,10 +39,10 @@ def test_parse_claude_credentials_valid():
     assert status == SnapshotStatus.OK
     assert len(windows) == 1
     w = windows[0]
-    assert w.amount == "5x 額度"
-    assert w.currency == "額度重置"
+    assert w.key == "weekly"
+    assert w.label == "Claude 額度"
     assert w.resets_at == datetime.fromtimestamp(1756888102, tz=timezone.utc)
-    assert hint == "額度重置 (5x 額度)"
+    assert hint == "Claude (5x 額度)"
 
 
 def test_parse_claude_credentials_invalid():

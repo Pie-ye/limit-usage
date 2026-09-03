@@ -120,10 +120,10 @@ def test_build_homepage_payload_claude_subscription():
             status=SnapshotStatus.OK,
             windows=[
                 UsageWindow(
-                    key="quota_reset",
-                    label="額度重置",
-                    amount="5x 額度",
-                    currency="額度重置",
+                    key="weekly",
+                    label="Claude 額度",
+                    used_percent=15.0,
+                    remaining_percent=85.0,
                     resets_at=datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc),
                 )
             ],
@@ -132,7 +132,8 @@ def test_build_homepage_payload_claude_subscription():
     ]
     out = build_homepage_payload(snaps, now=now)
     assert out["claude_status"] == "ok"
-    assert out["claude_weekly_used_percent"] is None
+    assert out["claude_weekly_used_percent"] == 15.0
+    assert out["claude_weekly_remaining_percent"] == 85.0
     assert out["claude_resets_at"].startswith("2026-09-03T08:00")
     assert out["claude_reset_display"] == "5小時 0分"
 

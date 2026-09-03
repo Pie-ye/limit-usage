@@ -56,20 +56,34 @@ def parse_claude_credentials(data: dict[str, Any]) -> tuple[SnapshotStatus, str,
     sub_display = format_subscription(sub_type)
     tier_display = format_tier(tier)
 
+    # Calculate remaining / used percentage based on standard 5-hour rate-limit window
+    used_pct = None
+    rem_pct = None
+    if resets_at is not None:
+        rem_sec = max(0.0, (resets_at - utcnow()).total_seconds())
+        window_sec = 18000.0  # 5 hours
+        rem_val = min(100.0, max(0.0, (rem_sec / window_sec) * 100.0))
+        rem_pct = round(rem_val, 1)
+        used_pct = round(100.0 - rem_val, 1)
+
     window = UsageWindow(
-        key="quota_reset",
-        label="額度重置",
-        amount=tier_display,
-        currency="額度重置",
+        key="weekly",
+        label="Claude 額度",
+        used_percent=used_pct,
+        remaining_percent=rem_pct,
         resets_at=resets_at,
+        limit_window_seconds=18000,
+        amount=None,
+        currency="%",
         raw_extra={
             "subscription_type": sub_type,
             "rate_limit_tier": tier,
+            "tier_display": tier_display,
             "scopes": scopes,
         },
     )
 
-    hint = f"額度重置 ({tier_display})"
+    hint = f"Claude ({tier_display})"
     return SnapshotStatus.OK, "Claude credentials active", [window], hint
 
 
