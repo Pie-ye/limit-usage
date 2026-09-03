@@ -120,20 +120,35 @@ def test_build_homepage_payload_claude_subscription():
             status=SnapshotStatus.OK,
             windows=[
                 UsageWindow(
-                    key="weekly",
-                    label="Claude 額度",
+                    key="5h",
+                    label="Claude · 5小時",
+                    used_percent=10.0,
+                    remaining_percent=90.0,
+                    resets_at=datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc),
+                ),
+                UsageWindow(
+                    key="1w",
+                    label="Claude · 週額度",
                     used_percent=15.0,
                     remaining_percent=85.0,
                     resets_at=datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc),
-                )
+                ),
+                UsageWindow(
+                    key="1w-fable",
+                    label="Claude · 週額度 (Fable)",
+                    used_percent=20.0,
+                    remaining_percent=80.0,
+                    resets_at=datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc),
+                ),
             ],
             fetched_at=now,
         ),
     ]
     out = build_homepage_payload(snaps, now=now)
     assert out["claude_status"] == "ok"
+    assert out["claude_5h_used_percent"] == 10.0
     assert out["claude_weekly_used_percent"] == 15.0
-    assert out["claude_weekly_remaining_percent"] == 85.0
+    assert out["claude_fable_used_percent"] == 20.0
     assert out["claude_resets_at"].startswith("2026-09-03T08:00")
     assert out["claude_reset_display"] == "5小時 0分"
 
@@ -141,6 +156,7 @@ def test_build_homepage_payload_claude_subscription():
 def test_build_homepage_payload_claude_missing():
     out = build_homepage_payload([])
     assert out["claude_status"] == "missing"
+    assert out["claude_5h_used_percent"] is None
     assert out["claude_weekly_used_percent"] is None
-    assert out["claude_weekly_remaining_percent"] is None
+    assert out["claude_fable_used_percent"] is None
     assert out["claude_reset_display"] is None
