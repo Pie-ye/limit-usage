@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     supergrok_cookie: str | None = None
     deepseek_api_key: str | None = None
     antigravity_token_path: str = "~/.gemini/antigravity-acp/acp_token.json"
+    claude_credentials_path: str = "~/.claude/.credentials.json"
 
     http_timeout_seconds: float = 20.0
     max_backoff_seconds: int = 900
@@ -53,6 +54,10 @@ class Settings(BaseSettings):
     @property
     def antigravity_token(self) -> Path:
         return expand_path(self.antigravity_token_path) or Path.home() / ".gemini" / "antigravity-acp" / "acp_token.json"
+
+    @property
+    def claude_credentials(self) -> Path:
+        return expand_path(self.claude_credentials_path) or Path.home() / ".claude" / ".credentials.json"
 
 
 @lru_cache

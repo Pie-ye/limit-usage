@@ -109,3 +109,37 @@ def test_build_homepage_payload_missing_providers():
     assert out["deepseek_status"] == "missing"
     assert out["codex_weekly_used_percent"] is None
     assert out["deepseek_cny"] is None
+
+
+def test_build_homepage_payload_claude_subscription():
+    now = datetime(2026, 9, 3, 3, 0, tzinfo=timezone.utc)
+    snaps = [
+        AccountSnapshot(
+            provider=ProviderId.CLAUDE,
+            display_name="Claude",
+            status=SnapshotStatus.OK,
+            windows=[
+                UsageWindow(
+                    key="quota_reset",
+                    label="額度重置",
+                    amount="5x 額度",
+                    currency="額度重置",
+                    resets_at=datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc),
+                )
+            ],
+            fetched_at=now,
+        ),
+    ]
+    out = build_homepage_payload(snaps, now=now)
+    assert out["claude_status"] == "ok"
+    assert out["claude_weekly_used_percent"] is None
+    assert out["claude_resets_at"].startswith("2026-09-03T08:00")
+    assert out["claude_reset_display"] == "5小時 0分"
+
+
+def test_build_homepage_payload_claude_missing():
+    out = build_homepage_payload([])
+    assert out["claude_status"] == "missing"
+    assert out["claude_weekly_used_percent"] is None
+    assert out["claude_weekly_remaining_percent"] is None
+    assert out["claude_reset_display"] is None

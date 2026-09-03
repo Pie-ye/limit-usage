@@ -18,6 +18,7 @@ services:
       CODEX_AUTH_PATH: "/secrets/codex/auth.json"
       GROK_AUTH_PATH: "/secrets/grok/auth.json"
       ANTIGRAVITY_TOKEN_PATH: "/secrets/antigravity/acp_token.json"
+      CLAUDE_CREDENTIALS_PATH: "/secrets/claude/.credentials.json"
     volumes:
       - ./data:/app/data
       # Codex is read-only; Grok is writable so rotated OIDC tokens persist.
@@ -27,6 +28,8 @@ services:
       - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
       # Google Antigravity OAuth token (from scripts/antigravity_login.py)
       - ${HOME}/.gemini/antigravity-acp:/secrets/antigravity:ro
+      # Claude Code credentials (from claude login / ~/.claude/.credentials.json)
+      - ${HOME}/.claude/.credentials.json:/secrets/claude/.credentials.json:ro
       # n8n monthly card-spend cache (Homepage / dashboard card)
       - ${HOME}/Container/n8n/data/homepage-card-spend.json:/secrets/card-spend/homepage-card-spend.json:ro
       - ${HOME}/Container/n8n/data/homepage-concerts.json:/secrets/concerts/homepage-concerts.json:ro

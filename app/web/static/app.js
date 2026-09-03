@@ -63,11 +63,43 @@
     return false;
   }
 
+  function isBalanceWindow(win) {
+    if (!win) return false;
+    const key = String(win.key || "").toLowerCase();
+    if (key.startsWith("balance")) return true;
+    // Numeric amount + currency code = money balance (DeepSeek etc.)
+    // Claude stores plan name in amount — that is NOT a balance row.
+    if (key === "subscription" || key === "plan" || key === "tier") return false;
+    if (win.amount == null || win.amount === "") return false;
+    const amt = Number(win.amount);
+    if (!Number.isFinite(amt)) return false;
+    const cur = String(win.currency || "").trim();
+    if (!cur) return false;
+    // Reject human labels like "5x 額度" / "Claude Max"
+    if (!/^[A-Za-z]{3,4}$/.test(cur)) return false;
+    return true;
+  }
+
+  function isSubscriptionWindow(win) {
+    if (!win) return false;
+    const key = String(win.key || "").toLowerCase();
+    if (key === "subscription" || key === "plan" || key === "tier" || key === "quota_reset" || key === "rate_limit") return true;
+    // Claude-style: non-numeric amount + non-ISO currency label
+    if (win.amount != null && !Number.isFinite(Number(win.amount))) {
+      const cur = String(win.currency || "");
+      if (cur && !/^[A-Za-z]{3,4}$/.test(cur.trim())) return true;
+    }
+    return false;
+  }
+
   function urgencyLevel(win) {
     let level = "ok";
     const reasons = [];
     const rem = remainingPct(win);
-    const isBalance = win.key && String(win.key).startsWith("balance");
+    const isBalance = isBalanceWindow(win);
+
+    // Subscription / plan cards: no low-balance urgency
+    if (isSubscriptionWindow(win)) return { level: "ok", reasons: [] };
 
     // DeepSeek: only CNY, warn when < 10; no reset reminders
     if (isBalance) {
@@ -122,15 +154,42 @@
       .replaceAll('"', "&quot;");
   }
 
+  function formatTierName(tier) {
+    if (!tier) return "標準額度";
+    const t = String(tier).toLowerCase();
+    if (t.includes("5x")) return "5x 額度";
+    if (t.includes("20x")) return "20x 額度";
+    return tier;
+  }
+
   function renderWindow(win) {
     const rem = remainingPct(win);
-    const isBalance = win.key && String(win.key).startsWith("balance");
+    const isBalance = isBalanceWindow(win);
+    const isSub = isSubscriptionWindow(win);
     const extra = win.raw_extra || {};
     const urg = urgencyLevel(win);
     const urgClass = urg.level === "ok" ? "" : `urgent-${urg.level}`;
     const windowClass = urg.level === "ok" ? "" : urgClass;
 
-    if (isBalance || win.amount != null) {
+    // Claude / rate limit reset cards: show quota reset countdown + tier
+    if (isSub) {
+      const tier = extra.rate_limit_tier ? formatTierName(extra.rate_limit_tier) : (win.amount || win.currency || "標準額度");
+      const resetAt = parseIso(win.resets_at);
+      const tierRaw = extra.rate_limit_tier ? String(extra.rate_limit_tier) : "";
+      return `
+        <div class="window ${windowClass}" data-reset="${win.resets_at || ""}">
+          <div class="window-title">
+            <span class="label">額度等級</span>
+            <span class="pct">${escapeHtml(tier)}</span>
+          </div>
+          <div class="countdown" style="margin-top:0.4rem;font-size:1.05rem;">
+            額度重置倒數：<strong class="cd">${fmtCountdown(resetAt)}</strong>
+          </div>
+          ${resetAt ? `<div class="balance-sub" style="margin-top:0.25rem;">重置時間：${fmtTime(resetAt)}${tierRaw ? ` · tier=${escapeHtml(tierRaw)}` : ""}</div>` : ""}
+        </div>`;
+    }
+
+    if (isBalance) {
       const granted = extra.granted_balance;
       const topped = extra.topped_up_balance;
       return `

@@ -16,6 +16,7 @@ class ProviderId(str, Enum):
     SUPERGROK = "supergrok"
     DEEPSEEK = "deepseek"
     ANTIGRAVITY = "antigravity"
+    CLAUDE = "claude"
 
 
 class SnapshotStatus(str, Enum):

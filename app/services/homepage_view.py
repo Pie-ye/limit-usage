@@ -261,5 +261,24 @@ def build_homepage_payload(
         out["antigravity_resets_at"] = _iso(reset) if reset else None
         out["antigravity_reset_display"] = _countdown_display(reset, current) if reset else None
 
+    # Claude 5h & weekly (matches Codex & SuperGrok schema)
+    claude = by_id.get(ProviderId.CLAUDE)
+    if not claude:
+        out.update(_empty_provider("claude", "missing"))
+    else:
+        updated_candidates.append(claude.fetched_at)
+        w_5h = _pick_5h(claude.windows)
+        w_1w = _pick_weekly(claude.windows) or (claude.windows[0] if claude.windows else None)
+        out["claude_status"] = claude.status.value
+        out["claude_5h_used_percent"] = w_5h.used_percent if w_5h else None
+        out["claude_5h_remaining_percent"] = w_5h.remaining_percent if w_5h else None
+        out["claude_5h_resets_at"] = _iso(w_5h.resets_at) if w_5h else None
+        out["claude_5h_reset_display"] = _countdown_display(w_5h.resets_at, current) if w_5h else None
+        out["claude_weekly_used_percent"] = w_1w.used_percent if w_1w else None
+        out["claude_weekly_remaining_percent"] = w_1w.remaining_percent if w_1w else None
+        reset = (w_1w.resets_at if w_1w else None) or (w_5h.resets_at if w_5h else None)
+        out["claude_resets_at"] = _iso(reset) if reset else None
+        out["claude_reset_display"] = _countdown_display(reset, current) if reset else None
+
     out["updated_at"] = _iso(max(updated_candidates)) if updated_candidates else _iso(current)
     return out
