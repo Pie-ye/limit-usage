@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     deepseek_api_key: str | None = None
     antigravity_token_path: str = "~/.gemini/antigravity-acp/acp_token.json"
     claude_credentials_path: str = "~/.claude/.credentials.json"
+    # claude-monitor --write-state snapshot; primary source for Claude quota.
+    claude_monitor_state_path: str = "~/.claude-monitor/state/latest.json"
+    claude_monitor_max_age_seconds: int = Field(default=900, ge=60)
+    # Per-model weekly windows (Fable) are OAuth-only; refresh them rarely.
+    # 0 disables the supplement entirely.
+    claude_scoped_refresh_seconds: int = Field(default=1800, ge=0)
+    claude_scoped_max_age_seconds: int = Field(default=7200, ge=0)
 
     http_timeout_seconds: float = 20.0
     max_backoff_seconds: int = 900
@@ -58,6 +65,13 @@ class Settings(BaseSettings):
     @property
     def claude_credentials(self) -> Path:
         return expand_path(self.claude_credentials_path) or Path.home() / ".claude" / ".credentials.json"
+
+    @property
+    def claude_monitor_state(self) -> Path:
+        return (
+            expand_path(self.claude_monitor_state_path)
+            or Path.home() / ".claude-monitor" / "state" / "latest.json"
+        )
 
 
 @lru_cache

@@ -7,6 +7,7 @@ Self-hosted dashboard for AI provider quotas:
 | **Codex** | 5-hour + weekly remaining % and reset countdown |
 | **SuperGrok** | Weekly / billing pool % and reset (best-effort) |
 | **DeepSeek** | API balance (total / granted / topped-up) |
+| **Claude** | 5-hour + weekly used % and reset, via [claude-monitor](#claude-quota-via-claude-monitor) |
 
 Default URL: **http://localhost:50048**
 
@@ -58,7 +59,75 @@ See `.env.example`.
 | `GROK_AUTH_PATH` | `~/.grok/auth.json` | From `grok login` |
 | `SUPERGROK_COOKIE` | — | Optional grok.com session cookie |
 | `DEEPSEEK_API_KEY` | — | DeepSeek API key |
+| `CLAUDE_MONITOR_STATE_PATH` | `~/.claude-monitor/state/latest.json` | claude-monitor snapshot (primary Claude source) |
+| `CLAUDE_MONITOR_MAX_AGE_SECONDS` | `900` | Ignore the snapshot past this age |
+| `CLAUDE_SCOPED_REFRESH_SECONDS` | `1800` | Per-model (Fable) window refresh; `0` disables |
+| `CLAUDE_SCOPED_MAX_AGE_SECONDS` | `7200` | Drop the cached Fable window past this age |
+| `CLAUDE_CREDENTIALS_PATH` | `~/.claude/.credentials.json` | Claude OAuth fallback + Fable window |
 | `DATABASE_PATH` | `./data/usage.db` | SQLite path |
+
+## Claude quota via claude-monitor
+
+Anthropic's `api/oauth/usage` endpoint is rate limited **per account**, and every
+running Claude Code session already polls it for its own footer. A background
+poller on top of that earns a `429` with `Retry-After: 3600`, which parks the
+Claude card for an hour at a time.
+
+So the card is fed from [claude-monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor)
+(MIT) instead, which makes **no API calls**:
+
+1. `claude-monitor --statusline` runs as a Claude Code status line hook. Claude
+   Code hands every status line script an official `rate_limits` block on stdin,
+   so the hook captures the real server-side percentages for free.
+2. A user timer folds that capture into a state file every 2 minutes.
+3. `ClaudeProvider` reads the state file and keeps only windows claude-monitor
+   labels `confidence: official`. Its `local_estimate` windows are token counts
+   over a guessed plan ceiling and drift badly (observed 170% against a real 12%).
+4. If the state file is missing or older than `CLAUDE_MONITOR_MAX_AGE_SECONDS`
+   — e.g. no Claude Code session has run for a while — the provider falls back
+   to the OAuth endpoint at its old 300s interval.
+
+### The Fable window
+
+claude-monitor's schema carries `five_hour` and `seven_day` only, because that
+is all Claude Code puts on the status line. The per-model weekly cap
+(`1w-fable`) exists solely on the OAuth endpoint, so the provider tops the card
+up with one call every `CLAUDE_SCOPED_REFRESH_SECONDS` (default 30 min) and
+merges the result into the claude-monitor windows.
+
+That supplement is deliberately isolated: it never sets the provider's
+`retry_after_seconds` and never fails the snapshot. If it is rate limited or the
+network is down, the card still renders claude-monitor's account-wide numbers
+and the Fable row keeps its cached value until
+`CLAUDE_SCOPED_MAX_AGE_SECONDS` (default 2 h) passes, after which the row drops
+rather than showing a stale figure. An OAuth fallback poll seeds the same cache
+for free, since its payload already contains the scoped rows.
+
+Set `CLAUDE_SCOPED_REFRESH_SECONDS=0` to turn the supplement off and accept a
+card with no per-model row.
+
+Setup:
+
+```bash
+uv tool install claude-monitor
+
+# 1. status line hook — add to ~/.claude/settings.json
+#    "statusLine": { "type": "command",
+#                    "command": "~/.local/bin/claude-monitor --statusline" }
+
+# 2. refresh timer
+install -m644 deploy/limit-usage-claude-monitor.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now limit-usage-claude-monitor.timer
+```
+
+Check which source served the card:
+
+```bash
+curl -sS http://127.0.0.1:50048/api/usage | jq '.snapshots[] | select(.provider=="claude") | .source'
+# "claude-monitor"  → official numbers, no API call
+# "oauth/usage"     → fell back; .message says why
+```
 
 ## API
 

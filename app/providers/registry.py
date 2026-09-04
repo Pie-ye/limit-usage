@@ -20,5 +20,12 @@ def build_providers(settings: Settings) -> list[UsageProvider]:
         ),
         DeepSeekProvider(settings.deepseek_api_key, timeout=timeout),
         AntigravityProvider(settings.antigravity_token, timeout=timeout),
-        ClaudeProvider(settings.claude_credentials, timeout=timeout),
+        ClaudeProvider(
+            settings.claude_credentials,
+            timeout=timeout,
+            monitor_state_path=settings.claude_monitor_state,
+            monitor_max_age_seconds=settings.claude_monitor_max_age_seconds,
+            scoped_refresh_seconds=settings.claude_scoped_refresh_seconds,
+            scoped_max_age_seconds=settings.claude_scoped_max_age_seconds,
+        ),
     ]

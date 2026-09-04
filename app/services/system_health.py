@@ -22,19 +22,29 @@ DEFAULT_DEPLOYMENT_STATUS_FILES = (
     Path("/home/pieye/Container/scripts/three_host/deployment-status.json"),
 )
 
-EXPECTED_SCHEDULES = {
-    "offsite_backup": {
-        "kind": "systemd-timer",
-        "unit": "three-host-offsite-backup.timer",
-        "state": "acceptance-gated",
-    },
-    "health_verification": {
-        "kind": "n8n-workflow",
-        "workflow": "threeHostHealth01",
-        "cron": "15 5 * * *",
-        "state": "scheduled",
-    },
+# The off-site schedule state is the only manifest field allowed to vary; every
+# other key stays an exact-match contract. An unrecognised state is reported as
+# unknown rather than guessed to be disabled or healthy.
+OFFSITE_STATE_DISPLAY = {
+    "acceptance-gated": ("disabled", "尚未啟用"),
+    "enabled": ("enabled", "每日 04:15"),
 }
+
+
+def expected_schedules(offsite_state: str) -> dict[str, dict[str, str]]:
+    return {
+        "offsite_backup": {
+            "kind": "systemd-timer",
+            "unit": "three-host-offsite-backup.timer",
+            "state": offsite_state,
+        },
+        "health_verification": {
+            "kind": "n8n-workflow",
+            "workflow": "threeHostHealth01",
+            "cron": "15 5 * * *",
+            "state": "scheduled",
+        },
+    }
 STALE_AFTER_SECONDS = 93600  # 26 hours
 WEEKLY_STALE_AFTER_SECONDS = 604800  # 7 days
 TAIPEI = timezone(timedelta(hours=8))
@@ -136,12 +146,19 @@ def _read_deployment_status(path: Path) -> dict[str, str]:
         or document.get("schema_version") != 2
     ):
         return unknown
-    if document.get("schedules") != EXPECTED_SCHEDULES:
+    schedules = document.get("schedules")
+    if not isinstance(schedules, dict):
         return unknown
+    offsite = schedules.get("offsite_backup")
+    offsite_state = offsite.get("state") if isinstance(offsite, dict) else None
+    mapped = OFFSITE_STATE_DISPLAY.get(offsite_state)
+    if mapped is None or schedules != expected_schedules(offsite_state):
+        return unknown
+    restic_status, restic_display = mapped
 
     return {
-        "restic_status": "disabled",
-        "restic_display": "尚未啟用",
+        "restic_status": restic_status,
+        "restic_display": restic_display,
         "health_schedule_status": "scheduled",
         "health_schedule_display": "n8n 每日 05:15",
     }
@@ -407,8 +424,10 @@ def _build_daily_weekly_displays(
     # 每週 · Restic 異地
     if payload["restic_status"] == "disabled":
         weekly_restic = "⚠ 尚未啟用"
-    elif payload["restic_status"] == "ok":
-        weekly_restic = "✓ 排程正常"
+    elif payload["restic_status"] in {"enabled", "ok"}:
+        # "enabled" is what the manifest reports once the acceptance gate is
+        # lifted; "ok" is kept for the older spelling.
+        weekly_restic = f"✓ {payload['restic_display']}"
     else:
         weekly_restic = "✗ 狀態未知"
 
