@@ -159,6 +159,11 @@ def _empty_provider(prefix: str, status: str = "error") -> dict[str, Any]:
         f"{prefix}_reset_display": None,
         f"{prefix}_status": status,
     }
+    if prefix == "claude":
+        out["claude_fable_used_percent"] = None
+        out["claude_fable_remaining_percent"] = None
+        out["claude_fable_resets_at"] = None
+        out["claude_fable_reset_display"] = None
     if prefix == "antigravity":
         out["antigravity_3p_5h_used_percent"] = None
         out["antigravity_3p_5h_remaining_percent"] = None
@@ -261,24 +266,36 @@ def build_homepage_payload(
         out["antigravity_resets_at"] = _iso(reset) if reset else None
         out["antigravity_reset_display"] = _countdown_display(reset, current) if reset else None
 
-    # Claude 5h & weekly (matches Codex & SuperGrok schema)
+    # Claude: 5h, weekly overall, Fable-scoped weekly cap (real usage from
+    # Anthropic's OAuth usage API — not derived from token expiry)
     claude = by_id.get(ProviderId.CLAUDE)
     if not claude:
         out.update(_empty_provider("claude", "missing"))
     else:
         updated_candidates.append(claude.fetched_at)
         w_5h = _pick_5h(claude.windows)
-        w_1w = _pick_weekly(claude.windows) or (claude.windows[0] if claude.windows else None)
+        w_1w = _pick_weekly(claude.windows)
+        w_fable = next(
+            (w for w in claude.windows if "fable" in (w.key or "").lower()), None
+        )
         out["claude_status"] = claude.status.value
+
         out["claude_5h_used_percent"] = w_5h.used_percent if w_5h else None
         out["claude_5h_remaining_percent"] = w_5h.remaining_percent if w_5h else None
         out["claude_5h_resets_at"] = _iso(w_5h.resets_at) if w_5h else None
         out["claude_5h_reset_display"] = _countdown_display(w_5h.resets_at, current) if w_5h else None
+
         out["claude_weekly_used_percent"] = w_1w.used_percent if w_1w else None
         out["claude_weekly_remaining_percent"] = w_1w.remaining_percent if w_1w else None
-        reset = (w_1w.resets_at if w_1w else None) or (w_5h.resets_at if w_5h else None)
-        out["claude_resets_at"] = _iso(reset) if reset else None
-        out["claude_reset_display"] = _countdown_display(reset, current) if reset else None
+        reset_w = (w_1w.resets_at if w_1w else None) or (w_5h.resets_at if w_5h else None)
+        out["claude_resets_at"] = _iso(reset_w) if reset_w else None
+        out["claude_reset_display"] = _countdown_display(reset_w, current) if reset_w else None
+
+        out["claude_fable_used_percent"] = w_fable.used_percent if w_fable else None
+        out["claude_fable_remaining_percent"] = w_fable.remaining_percent if w_fable else None
+        reset_f = (w_fable.resets_at if w_fable else None) or reset_w
+        out["claude_fable_resets_at"] = _iso(reset_f) if reset_f else None
+        out["claude_fable_reset_display"] = _countdown_display(reset_f, current) if reset_f else None
 
     out["updated_at"] = _iso(max(updated_candidates)) if updated_candidates else _iso(current)
     return out
