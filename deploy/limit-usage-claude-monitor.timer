@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh claude-monitor usage state every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+# Must stay well under CLAUDE_MONITOR_MAX_AGE_SECONDS (default 900) or the
+# provider treats the state file as stale and falls back to the OAuth endpoint.
+AccuracySec=15s
+Unit=limit-usage-claude-monitor.service
+
+[Install]
+WantedBy=timers.target

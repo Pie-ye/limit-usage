@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh claude-monitor usage state for the limit-usage Claude card
+Documentation=https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor
+
+[Service]
+Type=oneshot
+# Reads ~/.claude/projects and the statusline capture written by
+# `claude-monitor --statusline`; makes no network calls, so it can run often
+# without touching Anthropic's rate-limited usage endpoint.
+ExecStart=%h/.local/bin/claude-monitor --once --output json --plan max5 --write-state --state-file %h/.claude-monitor/state/latest.json
+StandardOutput=null
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target
