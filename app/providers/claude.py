@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -9,11 +10,25 @@ from typing import Any
 import httpx
 
 from app.models import AccountSnapshot, ProviderId, SnapshotStatus, UsageWindow, utcnow
-from app.providers.base import error_snapshot, http_get_json
+from app.providers.base import error_snapshot
+
+logger = logging.getLogger(__name__)
 
 # Undocumented endpoint that backs Claude Code's own usage HUD/statusline.
 # Requires the OAuth access token from ~/.claude/.credentials.json.
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+# This endpoint 429s quickly if polled as often as Codex/Grok (60s).
+DEFAULT_MIN_INTERVAL_SECONDS = 300
+FIVE_HOUR_SECONDS = 18000
+WEEK_SECONDS = 604800
+
+USAGE_HEADERS = {
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "oauth-2025-04-20",
+    "Accept": "application/json",
+    "User-Agent": "limit-usage/0.1",
+}
 
 
 def format_subscription(sub_type: str | None) -> str:
@@ -46,6 +61,19 @@ def format_tier(tier: str | None) -> str:
     return tier
 
 
+def parse_retry_after(value: str | None) -> int | None:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        seconds = int(float(text))
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
 def _parse_datetime(value: Any) -> datetime | None:
     if not value or not isinstance(value, str):
         return None
@@ -63,7 +91,13 @@ def _parse_datetime(value: Any) -> datetime | None:
         return None
 
 
-def _usage_window(entry: Any, key: str, label: str) -> UsageWindow | None:
+def _usage_window(
+    entry: Any,
+    key: str,
+    label: str,
+    *,
+    limit_window_seconds: int | None = None,
+) -> UsageWindow | None:
     if not isinstance(entry, dict):
         return None
     utilization = entry.get("utilization")
@@ -80,6 +114,7 @@ def _usage_window(entry: Any, key: str, label: str) -> UsageWindow | None:
         used_percent=used,
         remaining_percent=remaining,
         resets_at=_parse_datetime(entry.get("resets_at")),
+        limit_window_seconds=limit_window_seconds,
         currency="%",
         raw_extra={k: v for k, v in entry.items() if k not in {"utilization", "resets_at"}},
     )
@@ -111,15 +146,19 @@ def _limits_windows(limits: list[Any]) -> list[UsageWindow]:
         kind = entry.get("kind")
 
         if kind == "session":
-            key, label = "5h", "Claude · 5小時"
+            key, label, window_s = "5h", "Claude · 5小時", FIVE_HOUR_SECONDS
         elif kind == "weekly_all":
-            key, label = "1w", "Claude · 週額度"
+            key, label, window_s = "1w", "Claude · 週額度", WEEK_SECONDS
         elif kind == "weekly_scoped":
             scope = entry.get("scope") or {}
             model = (scope.get("model") or {}).get("display_name")
             if not model:
                 continue
-            key, label = f"1w-{_slugify_model(model)}", f"Claude · 週額度 ({model})"
+            key, label, window_s = (
+                f"1w-{_slugify_model(model)}",
+                f"Claude · 週額度 ({model})",
+                WEEK_SECONDS,
+            )
         else:
             continue
 
@@ -130,6 +169,7 @@ def _limits_windows(limits: list[Any]) -> list[UsageWindow]:
                 used_percent=used,
                 remaining_percent=remaining,
                 resets_at=resets_at,
+                limit_window_seconds=window_s,
                 currency="%",
                 raw_extra={k: v for k, v in entry.items() if k not in {"percent", "resets_at"}},
             )
@@ -154,14 +194,16 @@ def parse_claude_usage(payload: dict[str, Any]) -> list[UsageWindow]:
             return windows
 
     mapping = [
-        ("five_hour", "5h", "Claude · 5小時"),
-        ("seven_day", "1w", "Claude · 週額度"),
-        ("seven_day_opus", "1w-opus", "Claude · 週額度 (Opus)"),
-        ("seven_day_sonnet", "1w-sonnet", "Claude · 週額度 (Sonnet)"),
+        ("five_hour", "5h", "Claude · 5小時", FIVE_HOUR_SECONDS),
+        ("seven_day", "1w", "Claude · 週額度", WEEK_SECONDS),
+        ("seven_day_opus", "1w-opus", "Claude · 週額度 (Opus)", WEEK_SECONDS),
+        ("seven_day_sonnet", "1w-sonnet", "Claude · 週額度 (Sonnet)", WEEK_SECONDS),
     ]
     windows = []
-    for field, key, label in mapping:
-        window = _usage_window(payload.get(field), key, label)
+    for field, key, label, window_s in mapping:
+        window = _usage_window(
+            payload.get(field), key, label, limit_window_seconds=window_s
+        )
         if window is not None:
             windows.append(window)
     return windows
@@ -193,12 +235,21 @@ def extract_claude_oauth(
 class ClaudeProvider:
     provider_id = ProviderId.CLAUDE
     display_name = "Claude"
+    min_interval_seconds = DEFAULT_MIN_INTERVAL_SECONDS
 
-    def __init__(self, credentials_path: Path, timeout: float = 20.0) -> None:
+    def __init__(
+        self,
+        credentials_path: Path,
+        timeout: float = 20.0,
+        min_interval_seconds: int = DEFAULT_MIN_INTERVAL_SECONDS,
+    ) -> None:
         self.credentials_path = credentials_path
         self.timeout = timeout
+        self.min_interval_seconds = min_interval_seconds
+        self.retry_after_seconds: int | None = None
 
     async def fetch(self) -> AccountSnapshot:
+        self.retry_after_seconds = None
         if not self.credentials_path or not self.credentials_path.is_file():
             return error_snapshot(
                 self.provider_id,
@@ -231,37 +282,58 @@ class ClaudeProvider:
                 source="credentials",
             )
 
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            http_status, payload, err = await http_get_json(
-                client,
-                USAGE_URL,
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "anthropic-beta": "oauth-2025-04-20",
-                    "Accept": "application/json",
-                    "User-Agent": "limit-usage/0.1",
-                },
+        headers = {
+            **USAGE_HEADERS,
+            "Authorization": f"Bearer {access_token}",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+                resp = await client.get(USAGE_URL, headers=headers)
+        except httpx.HTTPError as exc:
+            return error_snapshot(
+                self.provider_id,
+                self.display_name,
+                SnapshotStatus.ERROR,
+                f"HTTP request failed: {exc}",
+                account_hint=hint,
+                source="oauth/usage",
             )
 
+        http_status = resp.status_code
         if http_status == 429:
+            self.retry_after_seconds = parse_retry_after(resp.headers.get("Retry-After"))
+            wait = self.retry_after_seconds
+            logger.warning(
+                "Claude usage API rate limited (retry-after=%s)",
+                wait if wait is not None else "none",
+            )
+            detail = "Claude usage API rate limited"
+            if wait is not None:
+                detail = f"{detail}; retry-after={wait}s"
             return error_snapshot(
                 self.provider_id,
                 self.display_name,
                 SnapshotStatus.RATE_LIMITED,
-                "Claude usage API rate limited",
+                detail,
                 account_hint=hint,
                 source="oauth/usage",
             )
         if http_status in (401, 403):
+            err = (resp.text or resp.reason_phrase or "")[:300]
             return error_snapshot(
                 self.provider_id,
                 self.display_name,
                 SnapshotStatus.AUTH_ERROR,
-                f"Auth failed ({http_status}). Re-run `claude login`. {err or ''}".strip(),
+                f"Auth failed ({http_status}). Re-run `claude login`. {err}".strip(),
                 account_hint=hint,
                 source="oauth/usage",
             )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
         if not isinstance(payload, dict):
+            err = (resp.text or resp.reason_phrase or "invalid JSON response")[:300]
             return error_snapshot(
                 self.provider_id,
                 self.display_name,

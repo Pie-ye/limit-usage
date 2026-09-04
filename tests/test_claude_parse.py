@@ -1,14 +1,20 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import json
+
+import httpx
 import pytest
+import respx
 
 from app.models import SnapshotStatus
 from app.providers.claude import (
+    USAGE_URL,
     ClaudeProvider,
     extract_claude_oauth,
     format_subscription,
     format_tier,
     parse_claude_usage,
+    parse_retry_after,
 )
 
 
@@ -24,6 +30,14 @@ def test_format_tier():
     assert format_tier("default_claude_max_5x") == "5x 額度"
     assert format_tier("default") == "標準"
     assert format_tier(None) == "標準"
+
+
+def test_parse_retry_after():
+    assert parse_retry_after("120") == 120
+    assert parse_retry_after("120.9") == 120
+    assert parse_retry_after("0") == 0
+    assert parse_retry_after("nope") is None
+    assert parse_retry_after(None) is None
 
 
 def test_extract_claude_oauth_valid():
@@ -58,10 +72,6 @@ def test_extract_claude_oauth_missing_access_token():
 
 
 def test_parse_claude_usage_limits_array_with_fable_scope():
-    # Real shape returned by api.anthropic.com/api/oauth/usage: the top-level
-    # seven_day_opus/seven_day_sonnet fields are null/deprecated, and the
-    # per-model breakdown (e.g. Fable) lives in limits[] with kind
-    # "weekly_scoped" instead.
     payload = {
         "five_hour": {"utilization": 15.0, "resets_at": "2026-09-03T10:20:00+00:00"},
         "seven_day": {"utilization": 3.0, "resets_at": "2026-09-05T05:00:00+00:00"},
@@ -99,9 +109,11 @@ def test_parse_claude_usage_limits_array_with_fable_scope():
 
     assert by_key["5h"].used_percent == 15.0
     assert by_key["5h"].remaining_percent == 85.0
+    assert by_key["5h"].limit_window_seconds == 18000
 
     assert by_key["1w"].used_percent == 3.0
     assert by_key["1w"].remaining_percent == 97.0
+    assert by_key["1w"].limit_window_seconds == 604800
 
     assert by_key["1w-fable"].used_percent == 2.0
     assert by_key["1w-fable"].remaining_percent == 98.0
@@ -120,7 +132,7 @@ def test_parse_claude_usage_falls_back_to_top_level_fields_without_limits():
     windows = parse_claude_usage(payload)
     by_key = {w.key: w for w in windows}
 
-    assert "1w-opus" not in by_key  # null entries are skipped
+    assert "1w-opus" not in by_key
     assert by_key["5h"].used_percent == 33.0
     assert by_key["5h"].remaining_percent == 67.0
     assert by_key["5h"].resets_at == datetime(2026, 4, 11, 7, 0, tzinfo=timezone.utc)
@@ -130,6 +142,21 @@ def test_parse_claude_usage_falls_back_to_top_level_fields_without_limits():
 
 def test_parse_claude_usage_empty_payload():
     assert parse_claude_usage({}) == []
+
+
+def _write_creds(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "sk-ant-test",
+                    "rateLimitTier": "default_claude_max_5x",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 @pytest.mark.asyncio
@@ -148,3 +175,54 @@ async def test_claude_provider_fetch_no_access_token(tmp_path: Path):
     snap = await provider.fetch()
     assert snap.status == SnapshotStatus.AUTH_ERROR
     assert snap.windows == []
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_fetch_rate_limited_reads_retry_after(tmp_path: Path):
+    creds = _write_creds(tmp_path / "creds.json")
+    provider = ClaudeProvider(creds)
+    respx.get(USAGE_URL).mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "180"}, text="rate limited")
+    )
+    snap = await provider.fetch()
+    assert snap.status == SnapshotStatus.RATE_LIMITED
+    assert snap.windows == []
+    assert provider.retry_after_seconds == 180
+    assert "retry-after=180" in (snap.message or "")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_fetch_ok_parses_limits(tmp_path: Path):
+    creds = _write_creds(tmp_path / "creds.json")
+    provider = ClaudeProvider(creds)
+    respx.get(USAGE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "limits": [
+                    {
+                        "kind": "session",
+                        "percent": 12,
+                        "resets_at": "2026-09-04T05:00:00Z",
+                    },
+                    {
+                        "kind": "weekly_all",
+                        "percent": 4,
+                        "resets_at": "2026-09-07T05:00:00Z",
+                    },
+                ]
+            },
+        )
+    )
+    snap = await provider.fetch()
+    assert snap.status == SnapshotStatus.OK
+    by_key = {w.key: w for w in snap.windows}
+    assert by_key["5h"].used_percent == 12.0
+    assert by_key["1w"].remaining_percent == 96.0
+    assert provider.retry_after_seconds is None
+    request = respx.calls.last.request
+    assert request.headers["authorization"] == "Bearer sk-ant-test"
+    assert request.headers["anthropic-beta"] == "oauth-2025-04-20"
+    assert request.headers["anthropic-version"] == "2023-06-01"

@@ -125,6 +125,7 @@ def test_build_homepage_payload_claude_subscription():
                     used_percent=10.0,
                     remaining_percent=90.0,
                     resets_at=datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc),
+                    limit_window_seconds=18000,
                 ),
                 UsageWindow(
                     key="1w",
@@ -132,6 +133,7 @@ def test_build_homepage_payload_claude_subscription():
                     used_percent=15.0,
                     remaining_percent=85.0,
                     resets_at=datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc),
+                    limit_window_seconds=604800,
                 ),
                 UsageWindow(
                     key="1w-fable",
@@ -139,6 +141,7 @@ def test_build_homepage_payload_claude_subscription():
                     used_percent=20.0,
                     remaining_percent=80.0,
                     resets_at=datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc),
+                    limit_window_seconds=604800,
                 ),
             ],
             fetched_at=now,
@@ -148,6 +151,7 @@ def test_build_homepage_payload_claude_subscription():
     assert out["claude_status"] == "ok"
     assert out["claude_5h_used_percent"] == 10.0
     assert out["claude_weekly_used_percent"] == 15.0
+    assert out["claude_weekly_remaining_percent"] == 85.0
     assert out["claude_fable_used_percent"] == 20.0
     assert out["claude_resets_at"].startswith("2026-09-03T08:00")
     assert out["claude_reset_display"] == "5小時 0分"
