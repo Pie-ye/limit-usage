@@ -1,8 +1,18 @@
 from datetime import datetime, timezone
 
 from app.models import AccountSnapshot, ProviderId, SnapshotStatus, UsageWindow
-from app.providers.antigravity import parse_quota_payload
+from app.providers.antigravity import CLOUD_CODE_BASE, parse_quota_payload
 from app.services.homepage_view import build_homepage_payload
+
+
+def test_quota_host_matches_agy_cli():
+    """agy 1.1.27 posts /usage to daily-cloudcode-pa, not cloudcode-pa.
+
+    The two hosts return different remainingFraction/resetTime for the same
+    Google account; using the prod host made Gemini 5h look 100% remaining
+    while `agy -p /usage` showed 0%.
+    """
+    assert CLOUD_CODE_BASE == "https://daily-cloudcode-pa.googleapis.com"
 
 
 PAYLOAD = {
@@ -91,3 +101,76 @@ def test_homepage_payload_missing_antigravity_has_other_fields():
     assert out["antigravity_status"] == "missing"
     assert out["antigravity_weekly_used_percent"] is None
     assert out["antigravity_other_weekly_used_percent"] is None
+
+
+# Live `agy -p /usage --output-format json` on 2026-09-05: Gemini 5h exhausted.
+AGY_USAGE_PAYLOAD = {
+    "groups": [
+        {
+            "displayName": "Gemini Models",
+            "buckets": [
+                {
+                    "bucketId": "gemini-weekly",
+                    "displayName": "Weekly Limit Remaining",
+                    "window": "weekly",
+                    "resetTime": "2026-09-11T00:05:54Z",
+                    "remainingFraction": 0.7972179055213928,
+                },
+                {
+                    "bucketId": "gemini-5h",
+                    "displayName": "Five Hour Limit Remaining",
+                    "window": "5h",
+                    "resetTime": "2026-09-05T17:27:28Z",
+                    "remainingFraction": 0,
+                },
+            ],
+        },
+        {
+            "displayName": "Claude and GPT models",
+            "buckets": [
+                {
+                    "bucketId": "3p-weekly",
+                    "displayName": "Weekly Limit Remaining",
+                    "window": "weekly",
+                    "resetTime": "2026-09-10T15:17:51Z",
+                    "remainingFraction": 0.9999690651893616,
+                },
+                {
+                    "bucketId": "3p-5h",
+                    "displayName": "Five Hour Limit Remaining",
+                    "window": "5h",
+                    "resetTime": "2026-09-05T21:51:55Z",
+                    "remainingFraction": 1,
+                },
+            ],
+        },
+    ]
+}
+
+
+def test_parse_agy_usage_keeps_zero_remaining_five_hour():
+    windows, message = parse_quota_payload(AGY_USAGE_PAYLOAD)
+    assert message is None
+    by_key = {w.key: w for w in windows}
+    assert by_key["5h"].remaining_percent == 0.0
+    assert by_key["5h"].used_percent == 100.0
+    assert by_key["1w"].remaining_percent == 79.72
+    assert by_key["1w"].used_percent == 20.28
+
+
+def test_homepage_payload_maps_exhausted_gemini_five_hour():
+    windows, _ = parse_quota_payload(AGY_USAGE_PAYLOAD)
+    snaps = [
+        AccountSnapshot(
+            provider=ProviderId.ANTIGRAVITY,
+            display_name="Antigravity",
+            status=SnapshotStatus.OK,
+            windows=windows,
+            fetched_at=datetime(2026, 9, 5, 16, 52, tzinfo=timezone.utc),
+        )
+    ]
+    out = build_homepage_payload(snaps, now=datetime(2026, 9, 5, 16, 52, tzinfo=timezone.utc))
+    assert out["antigravity_5h_used_percent"] == 100.0
+    assert out["antigravity_5h_remaining_percent"] == 0.0
+    assert out["antigravity_weekly_used_percent"] == 20.28
+    assert out["antigravity_weekly_remaining_percent"] == 79.72

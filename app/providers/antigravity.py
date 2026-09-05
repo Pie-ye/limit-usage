@@ -15,7 +15,10 @@ from app.providers.base import error_snapshot
 
 logger = logging.getLogger(__name__)
 
-CLOUD_CODE_BASE = "https://cloudcode-pa.googleapis.com"
+# agy CLI /usage uses the daily channel, not prod cloudcode-pa.
+# The two hosts return different remainingFraction/resetTime for the same account.
+CLOUD_CODE_BASE = "https://daily-cloudcode-pa.googleapis.com"
+CLOUD_CODE_SOURCE = "daily-cloudcode-pa.googleapis.com"
 QUOTA_SUMMARY_PATH = "/v1internal:retrieveUserQuotaSummary"
 TOKEN_URI_DEFAULT = "https://oauth2.googleapis.com/token"
 DEFAULT_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
@@ -267,7 +270,7 @@ class AntigravityProvider:
                 message=message,
                 windows=windows,
                 fetched_at=utcnow(),
-                source="cloudcode-pa.googleapis.com",
+                source=CLOUD_CODE_SOURCE,
             )
 
     async def _refresh_access(self, client: httpx.AsyncClient, fields: dict[str, Any]) -> str | None:
@@ -320,7 +323,7 @@ class AntigravityProvider:
                 SnapshotStatus.RATE_LIMITED,
                 "Antigravity Cloud Code API 被限流",
                 account_hint=email,
-                source="cloudcode-pa.googleapis.com",
+                source=CLOUD_CODE_SOURCE,
             )
         if "401" in text or "403" in text or "authentication" in text or "unauthorized" in text:
             return error_snapshot(
@@ -329,7 +332,7 @@ class AntigravityProvider:
                 SnapshotStatus.AUTH_ERROR,
                 f"Antigravity 授權失敗（{err[:120]}）。請重新執行登入。",
                 account_hint=email,
-                source="cloudcode-pa.googleapis.com",
+                source=CLOUD_CODE_SOURCE,
             )
         return error_snapshot(
             self.provider_id,
@@ -337,5 +340,5 @@ class AntigravityProvider:
             SnapshotStatus.ERROR,
             err or "Unknown error",
             account_hint=email,
-            source="cloudcode-pa.googleapis.com",
+            source=CLOUD_CODE_SOURCE,
         )
