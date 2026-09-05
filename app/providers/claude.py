@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import math
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -14,60 +15,26 @@ from app.providers.base import error_snapshot
 
 logger = logging.getLogger(__name__)
 
-# Undocumented endpoint that backs Claude Code's own usage HUD/statusline.
-# Requires the OAuth access token from ~/.claude/.credentials.json.
-#
-# Only used as a fallback now: the endpoint is rate limited per *account*, and
-# every running Claude Code session already polls it for its own footer, so a
-# background poller here reliably earns a 429 with `Retry-After: 3600`.
-# The primary source is claude-monitor's state file, which carries the same
-# official numbers with zero API calls — see MONITOR_* below.
+# Claude's statusline capture is the primary source, followed by Claude Code's
+# usage cache for windows (such as model-scoped weekly caps) not in statusline.
+# The OAuth endpoint is used only when neither local source has account windows.
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-
-# This endpoint 429s quickly if polled as often as Codex/Grok (60s).
-DEFAULT_MIN_INTERVAL_SECONDS = 300
-# Served from claude-monitor's state file there is no API call to ration, so
-# the poller may run at the normal cadence.
-MONITOR_MIN_INTERVAL_SECONDS = 60
-FIVE_HOUR_SECONDS = 18000
-WEEK_SECONDS = 604800
-
-# https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor
-# `claude-monitor --statusline` runs as a Claude Code statusline hook and
-# captures the official `rate_limits` block Claude Code hands its status line;
-# `claude-monitor --once --write-state` folds that capture into this file.
-MONITOR_SOURCE = "claude-monitor"
-DEFAULT_MONITOR_STATE_PATH = "~/.claude-monitor/state/latest.json"
-# The state file is only as fresh as the timer that writes it. Past this age we
-# stop trusting it and fall back to the OAuth endpoint.
-MONITOR_MAX_AGE_SECONDS = 900
-# claude-monitor labels every window it reports. Anything below `official` is
-# its own token-count estimate against a guessed plan ceiling, which drifts far
-# enough to be useless for a quota dashboard (observed 170% against a real 12%).
-MONITOR_TRUSTED_CONFIDENCE = "official"
-
-MONITOR_WINDOWS: dict[str, tuple[str, str, int | None]] = {
-    "five_hour": ("5h", "Claude · 5小時", FIVE_HOUR_SECONDS),
-    "seven_day": ("1w", "Claude · 週額度", WEEK_SECONDS),
-    "spend_limit": ("spend", "Claude · 支出上限", None),
-}
-
-# Per-model weekly windows (Fable) exist only on the OAuth endpoint: Claude Code
-# hands its status line the account-wide five_hour/seven_day pair and nothing
-# scoped, so claude-monitor has nothing to capture. We top the card up with a
-# rare, deliberately isolated call — rare enough not to provoke the 429 that
-# 300s polling did, and isolated so its failures never touch the main snapshot.
-SCOPED_REFRESH_SECONDS = 1800
-# Weekly windows move slowly, so a cached value stays useful well past one
-# refresh; drop it once even that stops being defensible.
-SCOPED_MAX_AGE_SECONDS = 7200
-
 USAGE_HEADERS = {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20",
     "Accept": "application/json",
     "User-Agent": "limit-usage/0.1",
 }
+
+STATUSLINE_SOURCE = "statusline"
+USAGE_CACHE_SOURCE = "claude-code-cache"
+OAUTH_SOURCE = "oauth/usage"
+LOCAL_MIN_INTERVAL_SECONDS = 60
+DEFAULT_OAUTH_MIN_INTERVAL_SECONDS = 1800
+OFFICIAL_MAX_AGE_SECONDS = 21600
+FRESH_MESSAGE_THRESHOLD_SECONDS = 900
+FIVE_HOUR_SECONDS = 18000
+WEEK_SECONDS = 604800
 
 
 def format_subscription(sub_type: str | None) -> str:
@@ -165,10 +132,7 @@ def _slugify_model(name: str) -> str:
 
 
 def _limits_windows(limits: list[Any]) -> list[UsageWindow]:
-    """Parse the `limits[]` array — the per-model breakdown (e.g. a Fable-scoped
-    weekly cap) that the top-level seven_day_opus/seven_day_sonnet fields don't
-    carry once they're null/deprecated on an account.
-    """
+    """Parse the OAuth `limits[]` array."""
     windows: list[UsageWindow] = []
     for entry in limits:
         if not isinstance(entry, dict):
@@ -217,15 +181,7 @@ def _limits_windows(limits: list[Any]) -> list[UsageWindow]:
 
 
 def parse_claude_usage(payload: dict[str, Any]) -> list[UsageWindow]:
-    """Parse the response of Anthropic's OAuth usage endpoint into UsageWindows.
-
-    Real usage, not derived from the OAuth token's expiry — the API reports
-    actual 5-hour and 7-day rate-limit consumption for the account. The
-    `limits[]` array is the primary source: it carries per-model-scoped weekly
-    caps (e.g. Fable) that the top-level seven_day_opus/seven_day_sonnet
-    fields no longer populate. Fall back to those top-level fields if `limits`
-    is absent (older/alternate response shape).
-    """
+    """Parse the response of Anthropic's OAuth usage endpoint."""
     limits = payload.get("limits")
     if isinstance(limits, list) and limits:
         windows = _limits_windows(limits)
@@ -238,7 +194,7 @@ def parse_claude_usage(payload: dict[str, Any]) -> list[UsageWindow]:
         ("seven_day_opus", "1w-opus", "Claude · 週額度 (Opus)", WEEK_SECONDS),
         ("seven_day_sonnet", "1w-sonnet", "Claude · 週額度 (Sonnet)", WEEK_SECONDS),
     ]
-    windows = []
+    windows: list[UsageWindow] = []
     for field, key, label, window_s in mapping:
         window = _usage_window(
             payload.get(field), key, label, limit_window_seconds=window_s
@@ -248,97 +204,212 @@ def parse_claude_usage(payload: dict[str, Any]) -> list[UsageWindow]:
     return windows
 
 
-def parse_scoped_usage(payload: Any) -> list[UsageWindow]:
-    """Pick only the per-model weekly windows out of an OAuth usage payload.
-
-    The account-wide windows are dropped: claude-monitor already supplies those
-    from the statusline capture, and they are the fresher of the two.
-    """
-    if not isinstance(payload, dict):
-        return []
-    limits = payload.get("limits")
-    if not isinstance(limits, list):
-        return []
-    scoped = [
-        entry
-        for entry in limits
-        if isinstance(entry, dict) and entry.get("kind") == "weekly_scoped"
-    ]
-    return _limits_windows(scoped)
+def _epoch_datetime(value: Any) -> datetime | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(float(value)):
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
-def parse_monitor_state(
+def _statusline_used(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    used = float(value)
+    if not math.isfinite(used) or used < 0 or used > 101:
+        return None
+    return round(min(used, 100.0), 1)
+
+
+def _statusline_resets_at(value: Any) -> datetime | None:
+    if isinstance(value, str):
+        return _parse_datetime(value)
+    return _epoch_datetime(value)
+
+
+def parse_statusline_capture(
     payload: Any,
-    *,
-    now: datetime | None = None,
-    max_age_seconds: int = MONITOR_MAX_AGE_SECONDS,
-) -> tuple[list[UsageWindow], str | None]:
-    """Parse claude-monitor's `--write-state` snapshot into UsageWindows.
-
-    Returns `(windows, reason)`; `reason` explains an empty result so the
-    caller can say why it fell through to the OAuth endpoint.
-
-    Only windows claude-monitor marks `confidence: official` are kept — those
-    came from the statusline capture and are the same server-side percentages
-    the API reports. Its `local_estimate` windows are token counts divided by a
-    guessed plan ceiling and are not comparable.
-    """
+) -> tuple[datetime | None, list[UsageWindow], str | None]:
     if not isinstance(payload, dict):
-        return [], "state file is not a JSON object"
+        return None, [], "statusline capture is not a JSON object"
 
-    generated_at = _parse_datetime(payload.get("generated_at"))
-    if generated_at is None:
-        return [], "state file has no readable generated_at"
-    age = ((now or utcnow()) - generated_at).total_seconds()
-    if age > max_age_seconds:
-        return [], f"state file is stale ({int(age)}s old, max {max_age_seconds}s)"
+    observed_at = _epoch_datetime(payload.get("captured_at_epoch"))
+    if observed_at is None:
+        return None, [], "statusline capture has no captured_at_epoch"
 
-    limits = payload.get("limits")
-    if not isinstance(limits, dict):
-        return [], "state file has no limits object"
+    rate_limits = payload.get("rate_limits")
+    if not isinstance(rate_limits, dict) or not rate_limits:
+        return observed_at, [], "statusline capture has no rate_limits"
 
     windows: list[UsageWindow] = []
-    for field, (key, label, window_s) in MONITOR_WINDOWS.items():
-        entry = limits.get(field)
+    standard_mapping = [
+        ("five_hour", "5h", "Claude · 5小時", FIVE_HOUR_SECONDS),
+        ("seven_day", "1w", "Claude · 週額度", WEEK_SECONDS),
+        ("spend_limit", "spend", "Claude · 支出上限", None),
+    ]
+    for field, key, label, window_s in standard_mapping:
+        entry = rate_limits.get(field)
         if not isinstance(entry, dict):
             continue
-        if entry.get("confidence") != MONITOR_TRUSTED_CONFIDENCE:
+        used = _statusline_used(entry.get("used_percentage"))
+        if used is None:
             continue
-        percent = entry.get("used_percentage")
-        if percent is None:
-            continue
-        try:
-            used = round(float(percent), 1)
-        except (TypeError, ValueError):
-            continue
-        resets_at = _parse_datetime(entry.get("resets_at"))
-        if resets_at is None:
-            epoch = entry.get("resets_at_epoch")
-            if isinstance(epoch, (int, float)):
-                resets_at = datetime.fromtimestamp(epoch, tz=timezone.utc)
-        raw_extra = {
-            "confidence": entry.get("confidence"),
-            "source_kind": (entry.get("source") or {}).get("kind"),
-        }
-        for extra in ("tokens_used", "token_limit"):
-            if entry.get(extra) is not None:
-                raw_extra[extra] = entry[extra]
         windows.append(
             UsageWindow(
                 key=key,
                 label=label,
                 used_percent=used,
                 remaining_percent=round(max(0.0, 100.0 - used), 1),
-                resets_at=resets_at,
+                resets_at=_statusline_resets_at(entry.get("resets_at")),
                 limit_window_seconds=window_s,
                 currency="%",
-                raw_extra=raw_extra,
+                raw_extra={
+                    k: v for k, v in entry.items() if k not in {"used_percentage", "resets_at"}
+                },
             )
         )
 
+    model_scoped = rate_limits.get("model_scoped", [])
+    if isinstance(model_scoped, list):
+        for entry in model_scoped:
+            if not isinstance(entry, dict):
+                continue
+            display_name = entry.get("displayName")
+            limit = entry.get("limit")
+            if not isinstance(display_name, str) or not display_name.strip():
+                continue
+            if not isinstance(limit, dict):
+                continue
+            used = _statusline_used(limit.get("utilization"))
+            if used is None:
+                continue
+            windows.append(
+                UsageWindow(
+                    key=f"1w-{_slugify_model(display_name)}",
+                    label=f"Claude · 週額度 ({display_name})",
+                    used_percent=used,
+                    remaining_percent=round(max(0.0, 100.0 - used), 1),
+                    resets_at=_statusline_resets_at(limit.get("resets_at")),
+                    limit_window_seconds=WEEK_SECONDS,
+                    currency="%",
+                    raw_extra={k: v for k, v in entry.items() if k != "limit"},
+                )
+            )
+
     if not windows:
-        return [], "state file has no windows with official rate limits yet"
-    return windows, None
+        return observed_at, [], "statusline capture has no usable windows"
+    return observed_at, windows, None
+
+
+def parse_usage_cache(
+    payload: Any,
+) -> tuple[datetime | None, list[UsageWindow], str | None]:
+    if not isinstance(payload, dict):
+        return None, [], "usage cache is not a JSON object"
+
+    fetched_at = payload.get("fetchedAtMs")
+    if isinstance(fetched_at, bool) or not isinstance(fetched_at, (int, float)):
+        return None, [], "usage cache has no fetchedAtMs"
+    if not math.isfinite(float(fetched_at)):
+        return None, [], "usage cache has no fetchedAtMs"
+    try:
+        observed_at = datetime.fromtimestamp(fetched_at / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None, [], "usage cache has no fetchedAtMs"
+
+    utilization = payload.get("utilization")
+    if not isinstance(utilization, dict):
+        return observed_at, [], "usage cache has no utilization"
+    windows = parse_claude_usage(utilization)
+    if not windows:
+        return observed_at, [], "usage cache has no usable windows"
+    return observed_at, windows, None
+
+
+def apply_rollover(windows: list[UsageWindow], *, now: datetime) -> list[UsageWindow]:
+    rolled: list[UsageWindow] = []
+    for window in windows:
+        if window.resets_at is None or now < window.resets_at:
+            rolled.append(window)
+            continue
+        raw_extra = {**window.raw_extra, "rolled_over": True}
+        if window.key == "5h":
+            rolled.append(
+                window.model_copy(
+                    update={
+                        "used_percent": 0.0,
+                        "remaining_percent": 100.0,
+                        "resets_at": None,
+                        "raw_extra": raw_extra,
+                    }
+                )
+            )
+        elif window.key == "1w" or window.key.startswith("1w-"):
+            resets_at = window.resets_at
+            while resets_at <= now:
+                resets_at += timedelta(days=7)
+            rolled.append(
+                window.model_copy(
+                    update={
+                        "used_percent": 0.0,
+                        "remaining_percent": 100.0,
+                        "resets_at": resets_at,
+                        "raw_extra": raw_extra,
+                    }
+                )
+            )
+        # Expired windows with unrelated keys are intentionally omitted.
+    return rolled
+
+
+def merge_official_windows(
+    sources: list[tuple[str, datetime, list[UsageWindow]]],
+    *,
+    now: datetime,
+) -> tuple[list[UsageWindow], list[str], datetime | None]:
+    ordered = sorted(sources, key=lambda source: source[1], reverse=True)
+    windows: list[UsageWindow] = []
+    seen: set[str] = set()
+    contributing: set[str] = set()
+    newest_observed_at: datetime | None = None
+    for source_name, observed_at, source_windows in ordered:
+        added = False
+        for window in source_windows:
+            if window.key in seen:
+                continue
+            seen.add(window.key)
+            added = True
+            windows.append(
+                window.model_copy(
+                    update={
+                        "raw_extra": {
+                            **window.raw_extra,
+                            "observed_at": observed_at.isoformat(),
+                            "source": source_name,
+                        }
+                    }
+                )
+            )
+        if added:
+            contributing.add(source_name)
+            if newest_observed_at is None or observed_at > newest_observed_at:
+                newest_observed_at = observed_at
+
+    contributing_sources = [
+        source
+        for source in (STATUSLINE_SOURCE, USAGE_CACHE_SOURCE)
+        if source in contributing
+    ]
+    return apply_rollover(windows, now=now), contributing_sources, newest_observed_at
+
+
+def format_age(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{int(seconds) // 60} 分鐘"
+    return f"{seconds / 3600:.1f} 小時"
 
 
 def extract_claude_oauth(
@@ -367,113 +438,55 @@ def extract_claude_oauth(
 class ClaudeProvider:
     provider_id = ProviderId.CLAUDE
     display_name = "Claude"
-    min_interval_seconds = DEFAULT_MIN_INTERVAL_SECONDS
 
     def __init__(
         self,
         credentials_path: Path,
         timeout: float = 20.0,
-        min_interval_seconds: int = DEFAULT_MIN_INTERVAL_SECONDS,
-        monitor_state_path: Path | None = None,
-        monitor_max_age_seconds: int = MONITOR_MAX_AGE_SECONDS,
-        scoped_refresh_seconds: int = SCOPED_REFRESH_SECONDS,
-        scoped_max_age_seconds: int = SCOPED_MAX_AGE_SECONDS,
+        *,
+        statusline_capture_path: Path | None = None,
+        usage_cache_path: Path | None = None,
+        official_max_age_seconds: int = OFFICIAL_MAX_AGE_SECONDS,
+        oauth_min_interval_seconds: int = DEFAULT_OAUTH_MIN_INTERVAL_SECONDS,
     ) -> None:
         self.credentials_path = credentials_path
         self.timeout = timeout
-        self.oauth_min_interval_seconds = min_interval_seconds
-        self.min_interval_seconds = min_interval_seconds
-        self.monitor_state_path = monitor_state_path
-        self.monitor_max_age_seconds = monitor_max_age_seconds
-        self.scoped_refresh_seconds = scoped_refresh_seconds
-        self.scoped_max_age_seconds = scoped_max_age_seconds
+        self.statusline_capture_path = statusline_capture_path
+        self.usage_cache_path = usage_cache_path
+        self.official_max_age_seconds = official_max_age_seconds
+        self.oauth_min_interval_seconds = oauth_min_interval_seconds
+        self.min_interval_seconds = oauth_min_interval_seconds
         self.retry_after_seconds: int | None = None
-        self._scoped_windows: list[UsageWindow] = []
-        self._scoped_fetched_at: datetime | None = None
-        self._scoped_next_attempt_at: datetime | None = None
 
-    def _store_scoped(self, windows: list[UsageWindow], *, now: datetime) -> None:
-        if not windows:
-            return
-        self._scoped_windows = windows
-        self._scoped_fetched_at = now
-        # Any successful read counts against the refresh budget, including one
-        # that came free with an OAuth fallback — otherwise the next poll spends
-        # a call on data we are already holding.
-        self._scoped_next_attempt_at = now + timedelta(seconds=self.scoped_refresh_seconds)
-
-    async def _scoped_supplement(self, access_token: str | None) -> list[UsageWindow]:
-        """Top the claude-monitor windows up with the per-model weekly caps.
-
-        Deliberately toothless: it never sets `retry_after_seconds` and never
-        raises. A 429 or a dead network here must not back off or degrade a
-        snapshot that claude-monitor already answered correctly — the worst
-        case is that the Fable window keeps its previous value.
-        """
-        now = utcnow()
-        if (
-            self._scoped_fetched_at
-            and (now - self._scoped_fetched_at).total_seconds() > self.scoped_max_age_seconds
-        ):
-            self._scoped_windows = []
-            self._scoped_fetched_at = None
-
-        if not access_token or self.scoped_refresh_seconds <= 0:
-            return self._scoped_windows
-        if self._scoped_next_attempt_at and now < self._scoped_next_attempt_at:
-            return self._scoped_windows
-
-        # Book the next attempt before the call, so a hang or an exception
-        # can't turn this into a retry loop against a rate-limited endpoint.
-        self._scoped_next_attempt_at = now + timedelta(seconds=self.scoped_refresh_seconds)
-        headers = {**USAGE_HEADERS, "Authorization": f"Bearer {access_token}"}
+    def _read_local_source(
+        self,
+        path: Path | None,
+        parser: Callable[[Any], tuple[datetime | None, list[UsageWindow], str | None]],
+        name: str,
+    ) -> tuple[list[UsageWindow], datetime | None, str | None]:
+        if path is None:
+            return [], None, f"{name} path not configured"
+        if not path.is_file():
+            return [], None, f"{name} missing at {path}"
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-                resp = await client.get(USAGE_URL, headers=headers)
-        except httpx.HTTPError as exc:
-            logger.info("Claude scoped-window refresh failed: %s", exc)
-            return self._scoped_windows
-
-        if resp.status_code == 429:
-            wait = parse_retry_after(resp.headers.get("Retry-After"))
-            if wait:
-                self._scoped_next_attempt_at = now + timedelta(
-                    seconds=max(wait, self.scoped_refresh_seconds)
-                )
-            logger.info(
-                "Claude scoped-window refresh rate limited (retry-after=%s); keeping cached windows",
-                wait if wait is not None else "none",
-            )
-            return self._scoped_windows
-        if resp.status_code >= 400:
-            logger.info("Claude scoped-window refresh returned HTTP %s", resp.status_code)
-            return self._scoped_windows
-
-        try:
-            payload = resp.json()
-        except ValueError:
-            logger.info("Claude scoped-window refresh returned invalid JSON")
-            return self._scoped_windows
-
-        self._store_scoped(parse_scoped_usage(payload), now=now)
-        return self._scoped_windows
-
-    def _read_monitor_state(self) -> tuple[list[UsageWindow], str | None]:
-        if not self.monitor_state_path:
-            return [], "no claude-monitor state path configured"
-        if not self.monitor_state_path.is_file():
-            return [], f"no claude-monitor state file at {self.monitor_state_path}"
-        try:
-            payload = json.loads(self.monitor_state_path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
-            return [], f"failed to read claude-monitor state: {exc}"
-        return parse_monitor_state(payload, max_age_seconds=self.monitor_max_age_seconds)
+            return [], None, f"{name} unreadable: {exc}"
+        observed_at, windows, reason = parser(payload)
+        if reason is not None:
+            return windows, observed_at, reason
+        if observed_at is None:
+            return [], None, f"{name} has no observation time"
+        age = (utcnow() - observed_at).total_seconds()
+        if age > self.official_max_age_seconds:
+            return [], observed_at, (
+                f"{name} is {format_age(age)} old "
+                f"(max {format_age(float(self.official_max_age_seconds))})"
+            )
+        return windows, observed_at, None
 
     async def fetch(self) -> AccountSnapshot:
         self.retry_after_seconds = None
-        # Best effort: the tier hint is nice to have, but claude-monitor's
-        # numbers don't need the credentials file, so a broken one must not
-        # blank the card on its own.
         hint: str | None = None
         creds_error: tuple[SnapshotStatus, str] | None = None
         access_token: str | None = None
@@ -485,6 +498,8 @@ class ClaudeProvider:
         else:
             try:
                 data = json.loads(self.credentials_path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("credentials JSON is not an object")
             except Exception as exc:
                 creds_error = (SnapshotStatus.ERROR, f"Failed to read credentials: {exc}")
             else:
@@ -492,26 +507,72 @@ class ClaudeProvider:
                 if status != SnapshotStatus.OK or not access_token:
                     creds_error = (status, msg)
 
-        windows, monitor_note = self._read_monitor_state()
-        if windows:
-            self.min_interval_seconds = MONITOR_MIN_INTERVAL_SECONDS
+        now = utcnow()
+        local_sources: list[tuple[str, datetime, list[UsageWindow]]] = []
+        local_reasons: list[str] = []
+        local_results = [
+            (
+                STATUSLINE_SOURCE,
+                "statusline capture",
+                self.statusline_capture_path,
+                parse_statusline_capture,
+            ),
+            (
+                USAGE_CACHE_SOURCE,
+                "usage cache",
+                self.usage_cache_path,
+                parse_usage_cache,
+            ),
+        ]
+        parsed_sources: list[tuple[str, list[UsageWindow], datetime | None, str | None]] = []
+        for source_name, name, path, parser in local_results:
+            windows, observed_at, reason = self._read_local_source(path, parser, name)
+            parsed_sources.append((source_name, windows, observed_at, reason))
+            if reason is not None:
+                local_reasons.append(reason)
+            elif observed_at is not None and windows:
+                local_sources.append((source_name, observed_at, windows))
+
+        windows, contributing, newest_observed_at = merge_official_windows(
+            local_sources, now=now
+        )
+        window_keys = {window.key for window in windows}
+        if "5h" in window_keys or "1w" in window_keys:
+            self.min_interval_seconds = LOCAL_MIN_INTERVAL_SECONDS
+            age = (now - newest_observed_at).total_seconds() if newest_observed_at else 0.0
+            message = (
+                None
+                if age <= FRESH_MESSAGE_THRESHOLD_SECONDS
+                else f"官方額度資料為 {format_age(age)} 前"
+            )
             return AccountSnapshot(
                 provider=self.provider_id,
                 display_name=self.display_name,
                 account_hint=hint,
                 status=SnapshotStatus.OK,
-                message=None,
-                windows=windows + await self._scoped_supplement(access_token),
-                fetched_at=utcnow(),
-                source=MONITOR_SOURCE,
+                message=message,
+                windows=windows,
+                fetched_at=now,
+                source="+".join(contributing),
             )
 
-        # Falling through to the rate-limited endpoint; ration it again.
+        for source_name, source_windows, _observed_at, reason in parsed_sources:
+            source_keys = {window.key for window in source_windows}
+            if reason is None and not source_keys.intersection({"5h", "1w"}):
+                display_name = (
+                    "statusline capture" if source_name == STATUSLINE_SOURCE else "usage cache"
+                )
+                local_reasons.append(f"{display_name} has no 5h/1w window")
+        local_note = "; ".join(local_reasons)
         self.min_interval_seconds = self.oauth_min_interval_seconds
-        logger.info("claude-monitor state unusable (%s); falling back to %s", monitor_note, USAGE_URL)
+        logger.info(
+            "Claude local sources unusable (%s); falling back to %s",
+            local_note,
+            USAGE_URL,
+        )
 
         def fallback_message(detail: str) -> str:
-            return f"{detail} (claude-monitor: {monitor_note})"
+            return f"{detail} (local sources: {local_note})"
 
         if creds_error is not None:
             status, msg = creds_error
@@ -524,10 +585,7 @@ class ClaudeProvider:
                 source="credentials",
             )
 
-        headers = {
-            **USAGE_HEADERS,
-            "Authorization": f"Bearer {access_token}",
-        }
+        headers = {**USAGE_HEADERS, "Authorization": f"Bearer {access_token}"}
         try:
             async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
                 resp = await client.get(USAGE_URL, headers=headers)
@@ -538,7 +596,7 @@ class ClaudeProvider:
                 SnapshotStatus.ERROR,
                 fallback_message(f"HTTP request failed: {exc}"),
                 account_hint=hint,
-                source="oauth/usage",
+                source=OAUTH_SOURCE,
             )
 
         http_status = resp.status_code
@@ -558,7 +616,7 @@ class ClaudeProvider:
                 SnapshotStatus.RATE_LIMITED,
                 fallback_message(detail),
                 account_hint=hint,
-                source="oauth/usage",
+                source=OAUTH_SOURCE,
             )
         if http_status in (401, 403):
             err = (resp.text or resp.reason_phrase or "")[:300]
@@ -566,9 +624,11 @@ class ClaudeProvider:
                 self.provider_id,
                 self.display_name,
                 SnapshotStatus.AUTH_ERROR,
-                fallback_message(f"Auth failed ({http_status}). Re-run `claude login`. {err}".strip()),
+                fallback_message(
+                    f"Auth failed ({http_status}). Re-run `claude login`. {err}".strip()
+                ),
                 account_hint=hint,
-                source="oauth/usage",
+                source=OAUTH_SOURCE,
             )
         try:
             payload = resp.json()
@@ -582,13 +642,10 @@ class ClaudeProvider:
                 SnapshotStatus.ERROR,
                 fallback_message(err or f"Unexpected response (HTTP {http_status})"),
                 account_hint=hint,
-                source="oauth/usage",
+                source=OAUTH_SOURCE,
             )
 
         windows = parse_claude_usage(payload)
-        # This payload already carries the scoped windows, so seed the cache
-        # from it rather than spending a second call on them later.
-        self._store_scoped(parse_scoped_usage(payload), now=utcnow())
         return AccountSnapshot(
             provider=self.provider_id,
             display_name=self.display_name,
@@ -596,6 +653,6 @@ class ClaudeProvider:
             status=SnapshotStatus.OK,
             message=None,
             windows=windows,
-            fetched_at=utcnow(),
-            source="oauth/usage",
+            fetched_at=now,
+            source=OAUTH_SOURCE,
         )
