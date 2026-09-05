@@ -373,15 +373,11 @@ def merge_official_windows(
     ordered = sorted(sources, key=lambda source: source[1], reverse=True)
     windows: list[UsageWindow] = []
     seen: set[str] = set()
-    contributing: set[str] = set()
-    newest_observed_at: datetime | None = None
     for source_name, observed_at, source_windows in ordered:
-        added = False
         for window in source_windows:
             if window.key in seen:
                 continue
             seen.add(window.key)
-            added = True
             windows.append(
                 window.model_copy(
                     update={
@@ -393,17 +389,28 @@ def merge_official_windows(
                     }
                 )
             )
-        if added:
-            contributing.add(source_name)
-            if newest_observed_at is None or observed_at > newest_observed_at:
-                newest_observed_at = observed_at
+
+    windows = apply_rollover(windows, now=now)
+    contributing = {
+        window.raw_extra.get("source")
+        for window in windows
+        if isinstance(window.raw_extra.get("source"), str)
+    }
+    contributing_observations = {
+        source_name: observed_at
+        for source_name, observed_at, _source_windows in sources
+        if source_name in contributing
+    }
+    newest_observed_at = (
+        max(contributing_observations.values()) if contributing_observations else None
+    )
 
     contributing_sources = [
         source
         for source in (STATUSLINE_SOURCE, USAGE_CACHE_SOURCE)
         if source in contributing
     ]
-    return apply_rollover(windows, now=now), contributing_sources, newest_observed_at
+    return windows, contributing_sources, newest_observed_at
 
 
 def format_age(seconds: float) -> str:
@@ -463,6 +470,8 @@ class ClaudeProvider:
         path: Path | None,
         parser: Callable[[Any], tuple[datetime | None, list[UsageWindow], str | None]],
         name: str,
+        *,
+        now: datetime | None = None,
     ) -> tuple[list[UsageWindow], datetime | None, str | None]:
         if path is None:
             return [], None, f"{name} path not configured"
@@ -475,9 +484,7 @@ class ClaudeProvider:
         observed_at, windows, reason = parser(payload)
         if reason is not None:
             return windows, observed_at, reason
-        if observed_at is None:
-            return [], None, f"{name} has no observation time"
-        age = (utcnow() - observed_at).total_seconds()
+        age = ((now or utcnow()) - observed_at).total_seconds()
         if age > self.official_max_age_seconds:
             return [], observed_at, (
                 f"{name} is {format_age(age)} old "
@@ -526,7 +533,9 @@ class ClaudeProvider:
         ]
         parsed_sources: list[tuple[str, list[UsageWindow], datetime | None, str | None]] = []
         for source_name, name, path, parser in local_results:
-            windows, observed_at, reason = self._read_local_source(path, parser, name)
+            windows, observed_at, reason = self._read_local_source(
+                path, parser, name, now=now
+            )
             parsed_sources.append((source_name, windows, observed_at, reason))
             if reason is not None:
                 local_reasons.append(reason)
@@ -543,7 +552,7 @@ class ClaudeProvider:
             message = (
                 None
                 if age <= FRESH_MESSAGE_THRESHOLD_SECONDS
-                else f"官方額度資料為 {format_age(age)} 前"
+                else f"官方額度資料為 {format_age(age)}前"
             )
             return AccountSnapshot(
                 provider=self.provider_id,

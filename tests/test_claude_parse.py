@@ -326,7 +326,7 @@ async def test_claude_provider_reports_age_when_capture_is_old(tmp_path: Path, m
     provider = ClaudeProvider(tmp_path / "missing.json", statusline_capture_path=capture)
     snapshot = await provider.fetch()
     assert snapshot.status == SnapshotStatus.OK
-    assert snapshot.message == "官方額度資料為 2.0 小時 前"
+    assert snapshot.message == "官方額度資料為 2.0 小時前"
 
 
 @pytest.mark.asyncio
@@ -389,3 +389,55 @@ async def test_claude_provider_works_without_credentials_file(tmp_path: Path, mo
     assert snapshot.status == SnapshotStatus.OK
     assert snapshot.source == STATUSLINE_SOURCE
     assert snapshot.account_hint is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_fetch_ok_parses_limits(tmp_path: Path) -> None:
+    creds = _write_creds(tmp_path / "creds.json")
+    route = respx.get(USAGE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "limits": [
+                    {"kind": "session", "percent": 12, "resets_at": "2026-09-06T00:00:00Z"},
+                    {"kind": "weekly_all", "percent": 4, "resets_at": "2026-09-07T00:00:00Z"},
+                    {
+                        "kind": "weekly_scoped",
+                        "percent": 8,
+                        "resets_at": "2026-09-07T00:00:00Z",
+                        "scope": {"model": {"display_name": "Fable"}},
+                    },
+                ]
+            },
+        )
+    )
+    provider = ClaudeProvider(creds)
+    snapshot = await provider.fetch()
+    assert snapshot.status == SnapshotStatus.OK
+    assert snapshot.source == OAUTH_SOURCE
+    assert {window.key for window in snapshot.windows} == {"5h", "1w", "1w-fable"}
+    request = route.calls.last.request
+    assert request.headers["authorization"] == "Bearer sk-ant-test"
+    assert request.headers["anthropic-beta"] == "oauth-2025-04-20"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_fetch_missing_credentials_reports_credentials_error(tmp_path: Path) -> None:
+    provider = ClaudeProvider(tmp_path / "missing.json")
+    snapshot = await provider.fetch()
+    assert snapshot.status == SnapshotStatus.AUTH_ERROR
+    assert snapshot.source == "credentials"
+    assert "local sources:" in (snapshot.message or "")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_fetch_no_access_token_reports_credentials_error(tmp_path: Path) -> None:
+    creds = _write_json(tmp_path / "creds.json", {"claudeAiOauth": {"rateLimitTier": "default"}})
+    provider = ClaudeProvider(creds)
+    snapshot = await provider.fetch()
+    assert snapshot.status == SnapshotStatus.AUTH_ERROR
+    assert snapshot.source == "credentials"
+    assert "local sources:" in (snapshot.message or "")
