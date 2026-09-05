@@ -20,14 +20,14 @@ from pathlib import Path
 
 
 def sync(config_path: Path, out_path: Path) -> bool:
-    config = json.loads(config_path.read_text())
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     cached = config.get("cachedUsageUtilization")
     if not isinstance(cached, dict):
         return False
 
     if out_path.exists():
         try:
-            existing = json.loads(out_path.read_text())
+            existing = json.loads(out_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             existing = None
         if isinstance(existing, dict) and existing.get("fetchedAtMs") == cached.get(
@@ -37,8 +37,12 @@ def sync(config_path: Path, out_path: Path) -> bool:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_name(out_path.name + f".{os.getpid()}.tmp")
-    tmp_path.write_text(json.dumps(cached))
-    os.replace(tmp_path, out_path)
+    try:
+        tmp_path.write_text(json.dumps(cached), encoding="utf-8")
+        os.replace(tmp_path, out_path)
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return True
 
 

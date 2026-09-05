@@ -7,7 +7,7 @@ Self-hosted dashboard for AI provider quotas:
 | **Codex** | 5-hour + weekly remaining % and reset countdown |
 | **SuperGrok** | Weekly / billing pool % and reset (best-effort) |
 | **DeepSeek** | API balance (total / granted / topped-up) |
-| **Claude** | 5-hour + weekly used % and reset, via [claude-monitor](#claude-quota-sources) |
+| **Claude** | 5-hour + weekly used % and reset, via [local Claude Code files](#claude-quota-sources) |
 
 Default URL: **http://localhost:50048**
 
@@ -107,10 +107,14 @@ that window instead of disappearing: the 5-hour window just stops showing a
 reset time, and the weekly window's reset is pushed forward by 7 days.
 
 **Source C — OAuth fallback.** Only when neither local source has a usable
-5-hour or weekly window does the provider call the OAuth endpoint, at most
-once every `CLAUDE_OAUTH_MIN_INTERVAL_SECONDS`. If Anthropic responds `429`,
-the poller fully honours the `Retry-After` header before trying again. When
-this path serves the card, `source` is `oauth/usage`.
+5-hour or weekly window does the provider call the OAuth endpoint. The
+provider throttles itself to at most one call every
+`CLAUDE_OAUTH_MIN_INTERVAL_SECONDS`, and also honours a `429`'s `Retry-After`
+header before trying again. While throttled, the card keeps serving the last
+OAuth result and the `message` notes its age (「沿用 N 分鐘前的 OAuth
+額度」) — the local files are still re-read every poll, so the card switches
+back to them the moment either one has fresh data. When the OAuth path serves
+the card, `source` is `oauth/usage`.
 
 ### Gotcha: never bind-mount the credentials file
 

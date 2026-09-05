@@ -93,6 +93,27 @@ def test_sync_creates_parent_directory(tmp_path: Path) -> None:
     assert json.loads(out_path.read_text()) == cached
 
 
+def test_sync_cleans_up_tmp_file_on_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.json"
+    out_path = tmp_path / "out.json"
+    cached = {"fetchedAtMs": 1000, "five_hour": {"utilization": 12}}
+    _write_config(config_path, cached)
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(sync_module.os, "replace", _boom)
+
+    with pytest.raises(OSError):
+        sync_module.sync(config_path, out_path)
+
+    tmp_path_candidate = out_path.with_name(out_path.name + f".{sync_module.os.getpid()}.tmp")
+    assert not tmp_path_candidate.exists()
+    assert not out_path.exists()
+
+
 def test_main_reports_bad_config(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     config_path = tmp_path / "config.json"
     out_path = tmp_path / "out.json"
