@@ -462,8 +462,10 @@ class ClaudeProvider:
         self.usage_cache_path = usage_cache_path
         self.official_max_age_seconds = official_max_age_seconds
         self.oauth_min_interval_seconds = oauth_min_interval_seconds
-        self.min_interval_seconds = oauth_min_interval_seconds
+        self.min_interval_seconds = LOCAL_MIN_INTERVAL_SECONDS
         self.retry_after_seconds: int | None = None
+        self._oauth_next_attempt_at: datetime | None = None
+        self._last_oauth_snapshot: AccountSnapshot | None = None
 
     def _read_local_source(
         self,
@@ -487,13 +489,12 @@ class ClaudeProvider:
         age = ((now or utcnow()) - observed_at).total_seconds()
         if age > self.official_max_age_seconds:
             return [], observed_at, (
-                f"{name} is {format_age(age)} old "
-                f"(max {format_age(float(self.official_max_age_seconds))})"
+                f"{name} is {int(age)}s old "
+                f"(max {self.official_max_age_seconds}s)"
             )
         return windows, observed_at, None
 
     async def fetch(self) -> AccountSnapshot:
-        self.retry_after_seconds = None
         hint: str | None = None
         creds_error: tuple[SnapshotStatus, str] | None = None
         access_token: str | None = None
@@ -517,7 +518,7 @@ class ClaudeProvider:
         now = utcnow()
         local_sources: list[tuple[str, datetime, list[UsageWindow]]] = []
         local_reasons: list[str] = []
-        local_results = [
+        local_sources_spec = [
             (
                 STATUSLINE_SOURCE,
                 "statusline capture",
@@ -531,23 +532,31 @@ class ClaudeProvider:
                 parse_usage_cache,
             ),
         ]
-        parsed_sources: list[tuple[str, list[UsageWindow], datetime | None, str | None]] = []
-        for source_name, name, path, parser in local_results:
+        parsed_sources: list[tuple[str, datetime | None, list[UsageWindow], str | None]] = []
+        for source_name, name, path, parser in local_sources_spec:
             windows, observed_at, reason = self._read_local_source(
                 path, parser, name, now=now
             )
-            parsed_sources.append((source_name, windows, observed_at, reason))
+            parsed_sources.append((source_name, observed_at, windows, reason))
+            if reason is None and observed_at is not None and windows:
+                local_sources.append((source_name, observed_at, windows))
+
+        for source_name, _observed_at, source_windows, reason in parsed_sources:
             if reason is not None:
                 local_reasons.append(reason)
-            elif observed_at is not None and windows:
-                local_sources.append((source_name, observed_at, windows))
+            elif not {window.key for window in source_windows}.intersection({"5h", "1w"}):
+                display_name = next(
+                    name
+                    for spec_source, name, _path, _parser in local_sources_spec
+                    if spec_source == source_name
+                )
+                local_reasons.append(f"{display_name} has no 5h/1w window")
 
         windows, contributing, newest_observed_at = merge_official_windows(
             local_sources, now=now
         )
         window_keys = {window.key for window in windows}
         if "5h" in window_keys or "1w" in window_keys:
-            self.min_interval_seconds = LOCAL_MIN_INTERVAL_SECONDS
             age = (now - newest_observed_at).total_seconds() if newest_observed_at else 0.0
             message = (
                 None
@@ -565,15 +574,7 @@ class ClaudeProvider:
                 source="+".join(contributing),
             )
 
-        for source_name, source_windows, _observed_at, reason in parsed_sources:
-            source_keys = {window.key for window in source_windows}
-            if reason is None and not source_keys.intersection({"5h", "1w"}):
-                display_name = (
-                    "statusline capture" if source_name == STATUSLINE_SOURCE else "usage cache"
-                )
-                local_reasons.append(f"{display_name} has no 5h/1w window")
         local_note = "; ".join(local_reasons)
-        self.min_interval_seconds = self.oauth_min_interval_seconds
         logger.info(
             "Claude local sources unusable (%s); falling back to %s",
             local_note,
@@ -594,6 +595,32 @@ class ClaudeProvider:
                 source="credentials",
             )
 
+        if self._oauth_next_attempt_at is not None and now < self._oauth_next_attempt_at:
+            wait = (self._oauth_next_attempt_at - now).total_seconds()
+            if self._last_oauth_snapshot is not None:
+                age = (now - self._last_oauth_snapshot.fetched_at).total_seconds()
+                return self._last_oauth_snapshot.model_copy(
+                    update={
+                        "message": (
+                            f"沿用 {format_age(age)}前的 OAuth 額度"
+                            f"（本地來源：{local_note}）"
+                        )
+                    }
+                )
+            return error_snapshot(
+                self.provider_id,
+                self.display_name,
+                SnapshotStatus.RATE_LIMITED,
+                f"OAuth fallback rationed; next attempt in {int(wait)}s "
+                f"(local sources: {local_note})",
+                account_hint=hint,
+                source=OAUTH_SOURCE,
+            )
+
+        self._oauth_next_attempt_at = now + timedelta(
+            seconds=self.oauth_min_interval_seconds
+        )
+
         headers = {**USAGE_HEADERS, "Authorization": f"Bearer {access_token}"}
         try:
             async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
@@ -610,8 +637,10 @@ class ClaudeProvider:
 
         http_status = resp.status_code
         if http_status == 429:
-            self.retry_after_seconds = parse_retry_after(resp.headers.get("Retry-After"))
-            wait = self.retry_after_seconds
+            wait = parse_retry_after(resp.headers.get("Retry-After"))
+            self._oauth_next_attempt_at = now + timedelta(
+                seconds=max(wait or 0, self.oauth_min_interval_seconds)
+            )
             logger.warning(
                 "Claude usage API rate limited (retry-after=%s)",
                 wait if wait is not None else "none",
@@ -655,7 +684,7 @@ class ClaudeProvider:
             )
 
         windows = parse_claude_usage(payload)
-        return AccountSnapshot(
+        snapshot = AccountSnapshot(
             provider=self.provider_id,
             display_name=self.display_name,
             account_hint=hint,
@@ -665,3 +694,5 @@ class ClaudeProvider:
             fetched_at=now,
             source=OAUTH_SOURCE,
         )
+        self._last_oauth_snapshot = snapshot
+        return snapshot

@@ -319,6 +319,39 @@ async def test_claude_provider_serves_statusline_capture_without_api(tmp_path: P
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_claude_provider_serves_usage_cache_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.providers.claude.utcnow", lambda: now)
+    cache = _write_json(
+        tmp_path / "cache.json",
+        {
+            "fetchedAtMs": now.timestamp() * 1000,
+            "utilization": {
+                "limits": [
+                    {"kind": "session", "percent": 12, "resets_at": "2026-09-06T00:00:00Z"},
+                    {"kind": "weekly_all", "percent": 4, "resets_at": "2026-09-07T00:00:00Z"},
+                    {
+                        "kind": "weekly_scoped",
+                        "percent": 8,
+                        "resets_at": "2026-09-07T00:00:00Z",
+                        "scope": {"model": {"display_name": "Fable"}},
+                    },
+                ]
+            },
+        },
+    )
+    route = respx.get(USAGE_URL).mock(return_value=httpx.Response(200, json={}))
+    provider = ClaudeProvider(tmp_path / "missing-capture.json", usage_cache_path=cache)
+    snapshot = await provider.fetch()
+    assert snapshot.status == SnapshotStatus.OK
+    assert snapshot.source == USAGE_CACHE_SOURCE
+    assert {window.key for window in snapshot.windows} >= {"5h", "1w", "1w-fable"}
+    assert not route.called
+    assert provider.min_interval_seconds == 60
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_claude_provider_reports_age_when_capture_is_old(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
     monkeypatch.setattr("app.providers.claude.utcnow", lambda: now)
@@ -362,7 +395,7 @@ async def test_claude_provider_falls_back_to_oauth_when_local_expired(tmp_path: 
     snapshot = await provider.fetch()
     assert route.called
     assert snapshot.source == OAUTH_SOURCE
-    assert provider.min_interval_seconds == 1800
+    assert provider.min_interval_seconds == 60
 
 
 @pytest.mark.asyncio
@@ -370,12 +403,105 @@ async def test_claude_provider_falls_back_to_oauth_when_local_expired(tmp_path: 
 async def test_claude_provider_oauth_429_message_names_local_reasons(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
     monkeypatch.setattr("app.providers.claude.utcnow", lambda: now)
+    before = now
     respx.get(USAGE_URL).mock(return_value=httpx.Response(429, headers={"Retry-After": "3600"}))
     provider = ClaudeProvider(_write_creds(tmp_path / "creds.json"))
     snapshot = await provider.fetch()
     assert snapshot.status == SnapshotStatus.RATE_LIMITED
-    assert provider.retry_after_seconds == 3600
+    assert provider.retry_after_seconds is None
+    assert provider._oauth_next_attempt_at >= before + timedelta(seconds=3600)
     assert "local sources:" in (snapshot.message or "")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_rations_oauth_between_polls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.providers.claude.utcnow", lambda: now)
+    route = respx.get(USAGE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "limits": [
+                    {"kind": "session", "percent": 12, "resets_at": "2026-09-06T00:00:00Z"},
+                    {"kind": "weekly_all", "percent": 4, "resets_at": "2026-09-07T00:00:00Z"},
+                    {
+                        "kind": "weekly_scoped",
+                        "percent": 8,
+                        "resets_at": "2026-09-07T00:00:00Z",
+                        "scope": {"model": {"display_name": "Fable"}},
+                    },
+                ]
+            },
+        )
+    )
+    provider = ClaudeProvider(_write_creds(tmp_path / "creds.json"))
+    first = await provider.fetch()
+    second = await provider.fetch()
+    assert route.call_count == 1
+    assert second.status == SnapshotStatus.OK
+    assert second.source == OAUTH_SOURCE
+    assert second.windows == first.windows
+    assert (second.message or "").startswith("沿用")
+    assert second.fetched_at == first.fetched_at
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_rationed_without_prior_snapshot_returns_rate_limited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.providers.claude.utcnow", lambda: now)
+    route = respx.get(USAGE_URL).mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "3600"})
+    )
+    provider = ClaudeProvider(_write_creds(tmp_path / "creds.json"))
+    await provider.fetch()
+    second = await provider.fetch()
+    assert route.call_count == 1
+    assert second.status == SnapshotStatus.RATE_LIMITED
+    assert "rationed" in (second.message or "")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_rereads_local_source_while_oauth_rationed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.providers.claude.utcnow", lambda: now)
+    capture = tmp_path / "capture.json"
+    route = respx.get(USAGE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"limits": [{"kind": "session", "percent": 12, "resets_at": "2026-09-06T00:00:00Z"}]},
+        )
+    )
+    provider = ClaudeProvider(_write_creds(tmp_path / "creds.json"), statusline_capture_path=capture)
+    first = await provider.fetch()
+    assert first.source == OAUTH_SOURCE
+    _write_json(capture, _statusline_payload(now))
+    second = await provider.fetch()
+    assert second.source == STATUSLINE_SOURCE
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_local_reason_order_is_statusline_then_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.providers.claude.utcnow", lambda: now)
+    spend_only = {
+        "captured_at_epoch": now.timestamp(),
+        "rate_limits": {"spend_limit": {"used_percentage": 5}},
+    }
+    capture = _write_json(tmp_path / "capture.json", spend_only)
+    respx.get(USAGE_URL).mock(return_value=httpx.Response(429, headers={"Retry-After": "3600"}))
+    provider = ClaudeProvider(
+        _write_creds(tmp_path / "creds.json"),
+        statusline_capture_path=capture,
+        usage_cache_path=tmp_path / "missing-cache.json",
+    )
+    snapshot = await provider.fetch()
+    message = snapshot.message or ""
+    assert message.index("statusline capture") < message.index("usage cache")
 
 
 @pytest.mark.asyncio
