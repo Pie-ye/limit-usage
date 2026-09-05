@@ -7,7 +7,7 @@ Self-hosted dashboard for AI provider quotas:
 | **Codex** | 5-hour + weekly remaining % and reset countdown |
 | **SuperGrok** | Weekly / billing pool % and reset (best-effort) |
 | **DeepSeek** | API balance (total / granted / topped-up) |
-| **Claude** | 5-hour + weekly used % and reset, via [claude-monitor](#claude-quota-via-claude-monitor) |
+| **Claude** | 5-hour + weekly used % and reset, via [claude-monitor](#claude-quota-sources) |
 
 Default URL: **http://localhost:50048**
 
@@ -59,52 +59,58 @@ See `.env.example`.
 | `GROK_AUTH_PATH` | `~/.grok/auth.json` | From `grok login` |
 | `SUPERGROK_COOKIE` | — | Optional grok.com session cookie |
 | `DEEPSEEK_API_KEY` | — | DeepSeek API key |
-| `CLAUDE_MONITOR_STATE_PATH` | `~/.claude-monitor/state/latest.json` | claude-monitor snapshot (primary Claude source) |
-| `CLAUDE_MONITOR_MAX_AGE_SECONDS` | `900` | Ignore the snapshot past this age |
-| `CLAUDE_SCOPED_REFRESH_SECONDS` | `1800` | Per-model (Fable) window refresh; `0` disables |
-| `CLAUDE_SCOPED_MAX_AGE_SECONDS` | `7200` | Drop the cached Fable window past this age |
-| `CLAUDE_CREDENTIALS_PATH` | `~/.claude/.credentials.json` | Claude OAuth fallback + Fable window |
+| `CLAUDE_STATUSLINE_CAPTURE_PATH` | `~/.claude-monitor/statusline/latest.json` | claude-monitor statusline capture |
+| `CLAUDE_USAGE_CACHE_PATH` | `~/.claude-monitor/state/claude-code-usage.json` | Claude Code usage cache copy |
+| `CLAUDE_OFFICIAL_MAX_AGE_SECONDS` | `21600` | Ignore a local file past this age |
+| `CLAUDE_OAUTH_MIN_INTERVAL_SECONDS` | `1800` | Spacing of OAuth fallback calls |
+| `CLAUDE_CREDENTIALS_PATH` | `~/.claude/.credentials.json` | Claude OAuth fallback + tier hint |
 | `DATABASE_PATH` | `./data/usage.db` | SQLite path |
 
-## Claude quota via claude-monitor
+## Claude quota sources
 
-Anthropic's `api/oauth/usage` endpoint is rate limited **per account**, and every
-running Claude Code session already polls it for its own footer. A background
-poller on top of that earns a `429` with `Retry-After: 3600`, which parks the
-Claude card for an hour at a time.
+Anthropic's `api/oauth/usage` endpoint is rate limited **per account**, and
+every running Claude Code session already polls it for its own footer. A
+background poller on top of that earns a `429` with `Retry-After: 3600`, which
+parks the Claude card for an hour at a time. So the card prefers two local
+files Claude Code tooling already writes, and only calls the OAuth endpoint as
+a last resort.
 
-So the card is fed from [claude-monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor)
-(MIT) instead, which makes **no API calls**:
+**Source A — statusline capture.** Claude Code hands every status line script
+an official `rate_limits` block on stdin (`five_hour` / `seven_day` /
+`spend_limit`, and on newer builds `model_scoped`). The
+[claude-monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor)
+(MIT) `--statusline` hook captures that block verbatim into
+`~/.claude-monitor/statusline/latest.json`. `ClaudeProvider` reads this file
+directly — it does **not** go through claude-monitor's `--write-state`, which
+downgrades the numbers to a token-count `local_estimate` after 600 seconds.
+The catch: this file only updates while an **interactive TUI** session has
+activity. Headless / SDK / ACP sessions never render a status line, so they
+never write it.
 
-1. `claude-monitor --statusline` runs as a Claude Code status line hook. Claude
-   Code hands every status line script an official `rate_limits` block on stdin,
-   so the hook captures the real server-side percentages for free.
-2. A user timer folds that capture into a state file every 2 minutes.
-3. `ClaudeProvider` reads the state file and keeps only windows claude-monitor
-   labels `confidence: official`. Its `local_estimate` windows are token counts
-   over a guessed plan ceiling and drift badly (observed 170% against a real 12%).
-4. If the state file is missing or older than `CLAUDE_MONITOR_MAX_AGE_SECONDS`
-   — e.g. no Claude Code session has run for a while — the provider falls back
-   to the OAuth endpoint at its old 300s interval.
+**Source B — Claude Code's own usage cache.** Claude Code also caches the
+usage endpoint's response in `~/.claude.json` under `cachedUsageUtilization`
+(this one includes the Fable `weekly_scoped` row). It refetches at most every
+5 minutes, and only when the TUI starts or a dialog opens.
+`deploy/claude-usage-cache-sync.py`, run by a systemd user timer every 2
+minutes, copies that key out into
+`~/.claude-monitor/state/claude-code-usage.json`.
 
-### The Fable window
+**Merge rule.** Both sources are eligible as long as they're newer than
+`CLAUDE_OFFICIAL_MAX_AGE_SECONDS`; for each window (5h / weekly / Fable) the
+provider takes whichever eligible source is newer. The card's `source` field
+reports which one(s) contributed: `statusline`, `claude-code-cache`, or
+`statusline+claude-code-cache`. If the data backing the card is older than 15
+minutes, the card's `message` says so in Chinese (官方額度資料為 N 分鐘前).
 
-claude-monitor's schema carries `five_hour` and `seven_day` only, because that
-is all Claude Code puts on the status line. The per-model weekly cap
-(`1w-fable`) exists solely on the OAuth endpoint, so the provider tops the card
-up with one call every `CLAUDE_SCOPED_REFRESH_SECONDS` (default 30 min) and
-merges the result into the claude-monitor windows.
+**Rollover.** Once a window's `resets_at` has passed, the card shows 0% for
+that window instead of disappearing: the 5-hour window just stops showing a
+reset time, and the weekly window's reset is pushed forward by 7 days.
 
-That supplement is deliberately isolated: it never sets the provider's
-`retry_after_seconds` and never fails the snapshot. If it is rate limited or the
-network is down, the card still renders claude-monitor's account-wide numbers
-and the Fable row keeps its cached value until
-`CLAUDE_SCOPED_MAX_AGE_SECONDS` (default 2 h) passes, after which the row drops
-rather than showing a stale figure. An OAuth fallback poll seeds the same cache
-for free, since its payload already contains the scoped rows.
-
-Set `CLAUDE_SCOPED_REFRESH_SECONDS=0` to turn the supplement off and accept a
-card with no per-model row.
+**Source C — OAuth fallback.** Only when neither local source has a usable
+5-hour or weekly window does the provider call the OAuth endpoint, at most
+once every `CLAUDE_OAUTH_MIN_INTERVAL_SECONDS`. If Anthropic responds `429`,
+the poller fully honours the `Retry-After` header before trying again. When
+this path serves the card, `source` is `oauth/usage`.
 
 ### Gotcha: never bind-mount the credentials file
 
@@ -128,7 +134,9 @@ docker exec limit-usage stat -c 'inode=%i mtime=%y' /secrets/claude/.credentials
 ```
 
 Different inodes means the mount has gone stale. The same trap applies to any
-other credential file a host tool rotates.
+other credential file a host tool rotates — `~/.claude.json` included, which is
+exactly why source B is copied out by a sync script instead of being mounted
+directly.
 
 Setup:
 
@@ -139,18 +147,21 @@ uv tool install claude-monitor
 #    "statusLine": { "type": "command",
 #                    "command": "~/.local/bin/claude-monitor --statusline" }
 
-# 2. refresh timer
+# 2. usage cache sync timer
 install -m644 deploy/limit-usage-claude-monitor.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now limit-usage-claude-monitor.timer
+systemctl --user restart limit-usage-claude-monitor.service   # first copy now
 ```
 
 Check which source served the card:
 
 ```bash
 curl -sS http://127.0.0.1:50048/api/usage | jq '.snapshots[] | select(.provider=="claude") | .source'
-# "claude-monitor"  → official numbers, no API call
-# "oauth/usage"     → fell back; .message says why
+# "statusline"                     → statusline capture only
+# "claude-code-cache"              → Claude Code's usage cache only
+# "statusline+claude-code-cache"   → both contributed, newer wins per window
+# "oauth/usage"                    → fell back; .message says why
 ```
 
 ## API
