@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -133,7 +135,7 @@ async def test_poller_skips_provider_until_backoff_elapses(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_poller_honours_retry_after_beyond_backoff_cap(tmp_path: Path):
+async def test_poller_honours_retry_after_beyond_backoff_cap(tmp_path: Path) -> None:
     repo = Repository(tmp_path / "usage.db")
     claude = FakeProvider(
         ProviderId.CLAUDE,
@@ -156,7 +158,7 @@ async def test_poller_honours_retry_after_beyond_backoff_cap(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_poller_backoff_cap_still_applies_without_retry_after(tmp_path: Path):
+async def test_poller_backoff_cap_still_applies_without_retry_after(tmp_path: Path) -> None:
     repo = Repository(tmp_path / "usage.db")
     claude = FakeProvider(
         ProviderId.CLAUDE,
