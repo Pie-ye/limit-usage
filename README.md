@@ -106,6 +106,30 @@ for free, since its payload already contains the scoped rows.
 Set `CLAUDE_SCOPED_REFRESH_SECONDS=0` to turn the supplement off and accept a
 card with no per-model row.
 
+### Gotcha: never bind-mount the credentials file
+
+`docker-compose.yml` mounts the **directory** `~/.claude`, not
+`~/.claude/.credentials.json`. Claude Code refreshes the OAuth token roughly
+every 8 hours by writing a new file and renaming it into place. A single-file
+bind mount resolves to an inode at container start and never follows that
+rename, so the container keeps reading the pre-rotation token. Everything looks
+fine until the old token is revoked, and then the card dies with:
+
+```
+Auth failed (401). ... "OAuth access token has been revoked."
+```
+
+which no restart of the *poller* fixes — only recreating the container did,
+until the next rotation. Diagnose by comparing inodes:
+
+```bash
+stat -c 'inode=%i mtime=%y' ~/.claude/.credentials.json
+docker exec limit-usage stat -c 'inode=%i mtime=%y' /secrets/claude/.credentials.json
+```
+
+Different inodes means the mount has gone stale. The same trap applies to any
+other credential file a host tool rotates.
+
 Setup:
 
 ```bash
