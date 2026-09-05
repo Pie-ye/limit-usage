@@ -19,7 +19,8 @@ services:
       GROK_AUTH_PATH: "/secrets/grok/auth.json"
       ANTIGRAVITY_TOKEN_PATH: "/secrets/antigravity/acp_token.json"
       CLAUDE_CREDENTIALS_PATH: "/secrets/claude/.credentials.json"
-      CLAUDE_MONITOR_STATE_PATH: "/secrets/claude-monitor/latest.json"
+      CLAUDE_STATUSLINE_CAPTURE_PATH: "/secrets/claude-monitor/statusline/latest.json"
+      CLAUDE_USAGE_CACHE_PATH: "/secrets/claude-monitor/state/claude-code-usage.json"
     volumes:
       - ./data:/app/data
       # Codex is read-only; Grok is writable so rotated OIDC tokens persist.
@@ -29,12 +30,20 @@ services:
       - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
       # Google Antigravity OAuth token (from scripts/antigravity_login.py)
       - ${HOME}/.gemini/antigravity-acp:/secrets/antigravity:ro
-      # Claude Code credentials (from claude login / ~/.claude/.credentials.json)
-      # Only the OAuth fallback needs these; the primary source is below.
-      - ${HOME}/.claude/.credentials.json:/secrets/claude/.credentials.json:ro
-      # Official Claude rate limits captured by claude-monitor's statusline hook
-      # and written by the limit-usage-claude-monitor.timer user unit.
-      - ${HOME}/.claude-monitor/state:/secrets/claude-monitor:ro
+      # Claude Code credentials (from claude login / ~/.claude/.credentials.json).
+      # Mount the PARENT of ~/.claude, not the file: Claude Code rotates the
+      # OAuth token by writing a new file and renaming it over the old one, and
+      # a single-file bind mount stays pinned to the original inode. The
+      # container would keep serving the pre-rotation token until it is revoked,
+      # then 401 forever. The rename happens inside ~/.claude, so mounting that
+      # directory is enough to let it through.
+      - ${HOME}/.claude:/secrets/claude:ro
+      # ~/.claude-monitor holds two files, both written by rename (so the
+      # directory, not either file, must be the mount): statusline/latest.json
+      # (written by the `claude-monitor --statusline` hook) and
+      # state/claude-code-usage.json (written by the
+      # limit-usage-claude-monitor.timer user unit).
+      - ${HOME}/.claude-monitor:/secrets/claude-monitor:ro
       # n8n monthly card-spend cache (Homepage / dashboard card)
       - ${HOME}/Container/n8n/data/homepage-card-spend.json:/secrets/card-spend/homepage-card-spend.json:ro
       - ${HOME}/Container/n8n/data/homepage-concerts.json:/secrets/concerts/homepage-concerts.json:ro

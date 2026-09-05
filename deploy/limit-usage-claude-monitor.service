@@ -1,15 +1,15 @@
 [Unit]
-Description=Refresh claude-monitor usage state for the limit-usage Claude card
-Documentation=https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor
+Description=Sync Claude Code usage cache for the limit-usage Claude card
 
 [Service]
 Type=oneshot
-# Reads ~/.claude/projects and the statusline capture written by
-# `claude-monitor --statusline`; makes no network calls, so it can run often
-# without touching Anthropic's rate-limited usage endpoint.
-ExecStart=%h/.local/bin/claude-monitor --once --output json --plan max5 --write-state --state-file %h/.claude-monitor/state/latest.json
+# Copies cachedUsageUtilization out of ~/.claude.json into the directory the
+# container mounts. Claude Code rewrites ~/.claude.json via rename, so a
+# single-file bind mount would go stale; a periodic copy sidesteps that.
+# No network calls.
+ExecStart=/usr/bin/python3 %h/Container/limit-usage/deploy/claude-usage-cache-sync.py
 StandardOutput=null
-TimeoutStartSec=120
+TimeoutStartSec=60
 
 [Install]
 WantedBy=default.target

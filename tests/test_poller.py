@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -130,3 +132,49 @@ async def test_poller_skips_provider_until_backoff_elapses(tmp_path: Path):
 
     await poller.poll_once()
     assert claude.calls == 1  # skipped; still in backoff
+
+
+@pytest.mark.asyncio
+async def test_poller_honours_retry_after_beyond_backoff_cap(tmp_path: Path) -> None:
+    repo = Repository(tmp_path / "usage.db")
+    claude = FakeProvider(
+        ProviderId.CLAUDE,
+        [_limited(ProviderId.CLAUDE)],
+        retry_after_seconds=3600,
+    )
+    codex = FakeProvider(ProviderId.CODEX, [_ok(ProviderId.CODEX, 80.0)])
+    poller = UsagePoller(
+        [claude, codex],
+        repo,
+        interval_seconds=60,
+        max_backoff_seconds=900,
+    )
+
+    start = utcnow()
+    await poller.poll_once()
+
+    assert poller._next_fetch_at[ProviderId.CLAUDE.value] >= start + timedelta(seconds=3600)
+    assert ProviderId.CODEX.value not in poller._next_fetch_at
+
+
+@pytest.mark.asyncio
+async def test_poller_backoff_cap_still_applies_without_retry_after(tmp_path: Path) -> None:
+    repo = Repository(tmp_path / "usage.db")
+    claude = FakeProvider(
+        ProviderId.CLAUDE,
+        [_limited(ProviderId.CLAUDE) for _ in range(6)],
+        retry_after_seconds=None,
+    )
+    poller = UsagePoller(
+        [claude],
+        repo,
+        interval_seconds=60,
+        max_backoff_seconds=900,
+    )
+
+    for _ in range(6):
+        poll_time = utcnow()
+        await poller.poll_once(ignore_skip=True)
+
+    skip_until = poller._next_fetch_at[ProviderId.CLAUDE.value]
+    assert (skip_until - poll_time) <= timedelta(seconds=900, milliseconds=100)

@@ -127,8 +127,11 @@ class UsagePoller:
             self._provider_failures[key] = fails
             factor = min(fails, 6)
             delay = float(self.interval_seconds * (2 ** (factor - 1)))
-            delay = max(delay, min_interval, self._retry_after(provider), float(self.interval_seconds))
+            delay = max(delay, min_interval, float(self.interval_seconds))
             delay = min(delay, float(self.max_backoff_seconds))
+            # A server-issued Retry-After is authoritative: retrying inside that window
+            # only re-arms the rate limit, so it may exceed the local backoff cap.
+            delay = max(delay, self._retry_after(provider))
             self._next_fetch_at[key] = now + timedelta(seconds=delay)
             logger.info(
                 "Provider %s backing off for %.0fs (status=%s failures=%s)",

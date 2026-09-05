@@ -31,13 +31,10 @@ class Settings(BaseSettings):
     deepseek_api_key: str | None = None
     antigravity_token_path: str = "~/.gemini/antigravity-acp/acp_token.json"
     claude_credentials_path: str = "~/.claude/.credentials.json"
-    # claude-monitor --write-state snapshot; primary source for Claude quota.
-    claude_monitor_state_path: str = "~/.claude-monitor/state/latest.json"
-    claude_monitor_max_age_seconds: int = Field(default=900, ge=60)
-    # Per-model weekly windows (Fable) are OAuth-only; refresh them rarely.
-    # 0 disables the supplement entirely.
-    claude_scoped_refresh_seconds: int = Field(default=1800, ge=0)
-    claude_scoped_max_age_seconds: int = Field(default=7200, ge=0)
+    claude_statusline_capture_path: str = "~/.claude-monitor/statusline/latest.json"
+    claude_usage_cache_path: str = "~/.claude-monitor/state/claude-code-usage.json"
+    claude_official_max_age_seconds: int = Field(default=21600, ge=60)
+    claude_oauth_min_interval_seconds: int = Field(default=1800, ge=60)
 
     http_timeout_seconds: float = 20.0
     max_backoff_seconds: int = 900
@@ -67,10 +64,17 @@ class Settings(BaseSettings):
         return expand_path(self.claude_credentials_path) or Path.home() / ".claude" / ".credentials.json"
 
     @property
-    def claude_monitor_state(self) -> Path:
+    def claude_statusline_capture(self) -> Path:
         return (
-            expand_path(self.claude_monitor_state_path)
-            or Path.home() / ".claude-monitor" / "state" / "latest.json"
+            expand_path(self.claude_statusline_capture_path)
+            or Path.home() / ".claude-monitor" / "statusline" / "latest.json"
+        )
+
+    @property
+    def claude_usage_cache(self) -> Path:
+        return (
+            expand_path(self.claude_usage_cache_path)
+            or Path.home() / ".claude-monitor" / "state" / "claude-code-usage.json"
         )
 
 
