@@ -175,6 +175,49 @@ def create_app() -> FastAPI:
         poller: UsagePoller = request.app.state.poller
         return build_homepage_payload(poller.get_snapshots())
 
+    def _routing_payload(request: Request, stale_after: int):
+        from datetime import timedelta
+
+        from app.models import utcnow
+        from app.services.routing_view import LOOKBACK_HOURS, build_routing_payload
+
+        repo: Repository = request.app.state.repository
+        poller: UsagePoller = request.app.state.poller
+        snaps = poller.get_snapshots()
+        since = utcnow() - timedelta(hours=max(LOOKBACK_HOURS.values()))
+        history_by: dict = {
+            s.provider.value: repo.get_history(provider=s.provider.value, limit=20000, since=since)
+            for s in snaps
+        }
+        return build_routing_payload(snaps, history_by, stale_after_seconds=stale_after)
+
+    @api.get("/routing")
+    async def routing(
+        request: Request,
+        model: str | None = None,
+        tier: str | None = None,
+        stale_after: int = 900,
+    ):
+        """Quota-aware routing view for dispatchers: per-pool remaining %, reset
+        countdown, burn rate, and a recommended model per tier.
+
+        ``?model=ID`` returns just that model's row; ``?tier=T2`` just that tier.
+        """
+        from fastapi import HTTPException
+
+        payload = _routing_payload(request, max(0, stale_after))
+        if model:
+            row = payload["models"].get(model)
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"Unknown model: {model}")
+            return {"server_time": payload["server_time"], "model": model, **row}
+        if tier:
+            row = payload["tiers"].get(tier.upper() if tier.lower() != "review" else "review")
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"Unknown tier: {tier}")
+            return {"server_time": payload["server_time"], "tier": tier, **row}
+        return payload
+
     @api.get("/host/ups")
     async def host_ups():
         """UPS status via upower (limit-usage must run on the host)."""

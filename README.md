@@ -179,6 +179,39 @@ curl -sS http://127.0.0.1:50048/api/usage | jq '.snapshots[] | select(.provider=
 - `GET /api/history?provider=&limit=`
 - `GET /api/trends?days=7` — 7-day series + burn-rate work estimates
 - `GET /api/system/health` — companion endpoint for Homepage system health and backup freshness
+- `GET /api/routing` — quota-aware model routing for dispatchers (see below)
+
+### Model routing for Trellis / `dispatch`
+
+`GET /api/routing` folds every provider into the vendor pools the
+orchestrating-development `dispatch` script knows (`claude`, `codex`, `grok`,
+`agy`, `agy-3p`) and answers, for each pool, model and tier:
+
+| Field | Meaning |
+|---|---|
+| `windows.<slot>.remaining_percent` | Left in that window (`5h`, `1w`, `1w-fable`) |
+| `windows.<slot>.seconds_until_reset` / `resets_at` | Time until the window resets |
+| `windows.<slot>.burn_per_hour` | % of window consumed per hour, from recent history (2 h lookback for 5h windows, 24 h for weekly); `null` until there are ≥2 samples |
+| `windows.<slot>.will_last_until_reset` | `false` when the current pace empties the window before it resets; `projected_used_at_reset` gives the number |
+| `binding_slot` / `score` / `level` | Lowest-remaining window among the ones the model draws on; score = its remaining %, halved when the pace won't last; level `ok` / `low` (≤20 %) / `critical` (≤10 %) / `unknown` |
+| `usable` | `status == ok` and level not `critical` / `unknown` |
+| `stale` / `data_age_seconds` | Data older than `?stale_after=` seconds (default 900) |
+| `tiers.<T0..T3,review>.recommended` | The ladder's primary model if usable, else the best-scoring usable candidate; `candidates` is the ranked list and `fallback_used` / `reason` say why |
+
+Model → pool mapping lives in `app/services/routing_view.py` (`MODELS`,
+`TIERS`); `claude-fable-5-1` additionally binds on the Fable weekly cap, the
+other Claude models ignore it. Filters: `?model=claude-sonnet-5` returns one
+model's row, `?tier=T2` one tier.
+
+Shell recipe for `dispatch`:
+
+```bash
+ROUTING=http://127.0.0.1:50048/api/routing
+# pick the model for a tier, falling back automatically when the primary pool is critical
+read -r MODEL VENDOR < <(curl -sf "$ROUTING?tier=T2" | jq -r '"\(.recommended) \(.vendor)"')
+# or gate a specific model
+curl -sf "$ROUTING?model=claude-sonnet-5" | jq -e '.usable and (.score > 30)' >/dev/null || echo "sonnet pool low"
+```
 
 ## System Health and Backup Status Truth
 
