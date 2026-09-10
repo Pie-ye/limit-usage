@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from app import __version__
 from app.api.routes import create_api_router
@@ -15,6 +16,7 @@ from app.config import get_settings
 from app.db.repository import Repository
 from app.providers.registry import build_providers
 from app.services.poller import UsagePoller
+from app.services.routing_feedback import FeedbackRegistry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +25,18 @@ logging.basicConfig(
 logger = logging.getLogger("limit-usage")
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+
+
+class RoutingFeedback(BaseModel):
+    """One dispatch outcome. ``model`` resolves the pool; ``pool`` is the
+    fallback when the model is not in ``MODELS`` (unknown ids are rejected)."""
+
+    model: str | None = None
+    pool: str | None = None
+    ok: bool = False
+    status: int | None = None
+    error: str | None = None
+    retry_after_seconds: float | None = None
 
 
 @asynccontextmanager
@@ -40,6 +54,7 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.repository = repo
     app.state.poller = poller
+    app.state.routing_feedback = FeedbackRegistry()
     poller.start()
     logger.info(
         "limit-usage v%s listening config port=%s db=%s",
@@ -175,7 +190,14 @@ def create_app() -> FastAPI:
         poller: UsagePoller = request.app.state.poller
         return build_homepage_payload(poller.get_snapshots())
 
-    def _routing_payload(request: Request, stale_after: int):
+    def _routing_payload(
+        request: Request,
+        stale_after: int,
+        *,
+        avoid_vendor: str | None = None,
+        vendors: list[str] | None = None,
+        min_score: float | None = None,
+    ):
         from datetime import timedelta
 
         from app.models import utcnow
@@ -183,13 +205,22 @@ def create_app() -> FastAPI:
 
         repo: Repository = request.app.state.repository
         poller: UsagePoller = request.app.state.poller
+        feedback: FeedbackRegistry = request.app.state.routing_feedback
         snaps = poller.get_snapshots()
         since = utcnow() - timedelta(hours=max(LOOKBACK_HOURS.values()))
         history_by: dict = {
             s.provider.value: repo.get_history(provider=s.provider.value, limit=20000, since=since)
             for s in snaps
         }
-        return build_routing_payload(snaps, history_by, stale_after_seconds=stale_after)
+        return build_routing_payload(
+            snaps,
+            history_by,
+            stale_after_seconds=stale_after,
+            cooldowns=feedback.active(),
+            avoid_vendor=avoid_vendor,
+            vendors=vendors,
+            min_score=min_score,
+        )
 
     @api.get("/routing")
     async def routing(
@@ -197,15 +228,26 @@ def create_app() -> FastAPI:
         model: str | None = None,
         tier: str | None = None,
         stale_after: int = 900,
+        avoid_vendor: str | None = None,
+        vendors: str | None = None,
+        min_score: float | None = None,
     ):
         """Quota-aware routing view for dispatchers: per-pool remaining %, reset
         countdown, burn rate, and a recommended model per tier.
 
         ``?model=ID`` returns just that model's row; ``?tier=T2`` just that tier.
+        Filters (affect ``eligible`` / ``recommended`` only): ``avoid_vendor=claude``,
+        ``vendors=claude,codex``, ``min_score=20``.
         """
         from fastapi import HTTPException
 
-        payload = _routing_payload(request, max(0, stale_after))
+        payload = _routing_payload(
+            request,
+            max(0, stale_after),
+            avoid_vendor=avoid_vendor or None,
+            vendors=vendors.split(",") if vendors else None,
+            min_score=min_score,
+        )
         if model:
             row = payload["models"].get(model)
             if row is None:
@@ -217,6 +259,54 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail=f"Unknown tier: {tier}")
             return {"server_time": payload["server_time"], "tier": tier, **row}
         return payload
+
+    @api.get("/routing/feedback")
+    async def routing_feedback_state(request: Request):
+        """Cooldown state per pool as fed by dispatch (see POST)."""
+        feedback: FeedbackRegistry = request.app.state.routing_feedback
+        return feedback.snapshot()
+
+    @api.post("/routing/feedback")
+    async def routing_feedback(request: Request, body: RoutingFeedback):
+        """Record one dispatch outcome. A failure puts the model's pool on a
+        cooldown (exponential for rate limits, fixed for auth/transient errors,
+        ``retry_after_seconds`` wins, all capped at 30 min); a success clears it.
+        """
+        from fastapi import HTTPException
+
+        from app.services.routing_view import MODELS, POOLS
+
+        pool = body.pool
+        if body.model:
+            spec = MODELS.get(body.model)
+            if spec is None:
+                raise HTTPException(status_code=404, detail=f"Unknown model: {body.model}")
+            pool = spec["pool"]
+        elif pool and pool not in POOLS:
+            raise HTTPException(status_code=404, detail=f"Unknown pool: {pool}")
+        if not pool:
+            raise HTTPException(status_code=422, detail="model or pool is required")
+        feedback: FeedbackRegistry = request.app.state.routing_feedback
+        result = feedback.report(
+            pool,
+            ok=body.ok,
+            status=body.status,
+            error=body.error,
+            retry_after_seconds=body.retry_after_seconds,
+            model=body.model,
+        )
+        logger.info(
+            "routing feedback %s model=%s ok=%s status=%s kind=%s cooldown=%ss",
+            pool, body.model, body.ok, body.status, result["kind"], result["cooldown_seconds"],
+        )
+        return result
+
+    @api.delete("/routing/feedback")
+    async def routing_feedback_clear(request: Request, pool: str | None = None):
+        """Drop cooldown state (one pool, or all)."""
+        feedback: FeedbackRegistry = request.app.state.routing_feedback
+        feedback.clear(pool)
+        return {"cleared": pool or "all"}
 
     @api.get("/host/ups")
     async def host_ups():

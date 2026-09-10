@@ -28,11 +28,28 @@ all models whose ``max_tier`` covers it; ``recommended`` is the usable one
 with the highest quota score, then the highest ``bench`` (benchmark index)
 among equal scores, then the cheapest. ``candidates`` is always
 returned in that order so the caller can apply its own policy instead.
+
+Dispatch feedback (see ``app.services.routing_feedback``): a pool that a
+subagent just found rate-limited or broken is ``cooling`` until
+``unavailable_until`` and is not usable meanwhile, whatever the poller says.
+
+Caller filters (all optional, applied to ``eligible`` and ``recommended`` but
+never to ``usable``, which stays a fact about the pool):
+
+* ``avoid_vendor`` — cross-vendor review rule (reviewer ≠ implementer vendor)
+* ``vendors`` — restrict to these vendor CLIs (Trellis channel only spawns
+  ``claude`` / ``codex`` workers)
+* ``min_score`` — floor on the quota score
+
+When a tier has no eligible candidate, ``next_available_at`` /
+``wait_seconds`` say when the earliest one comes back (end of cooldown or
+window reset), so the dispatcher can choose between waiting and the static
+ladder.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from app.models import AccountSnapshot, ProviderId, UsageWindow, utcnow
@@ -273,20 +290,54 @@ def _score(windows: dict[str, dict[str, Any] | None], slots: list[str]) -> dict[
     }
 
 
+_NO_COOLDOWN: dict[str, Any] = {
+    "cooling": False,
+    "unavailable_until": None,
+    "seconds_left": 0,
+    "backoff_level": 0,
+    "kind": None,
+    "last_error": None,
+}
+
+
+def _cooldown_view(cooldowns: dict[str, dict[str, Any]], pool_id: str) -> dict[str, Any]:
+    state = cooldowns.get(pool_id)
+    if not state or not state.get("cooling"):
+        return dict(_NO_COOLDOWN)
+    return {k: state.get(k, _NO_COOLDOWN[k]) for k in _NO_COOLDOWN}
+
+
+def _wait_seconds(row: dict[str, Any]) -> int | None:
+    """Seconds until a non-eligible model row could become usable again."""
+    cd = row.get("cooldown") or {}
+    if cd.get("cooling"):
+        return int(cd.get("seconds_left") or 0)
+    if row.get("level") in {"critical", "low"} and row.get("seconds_until_reset") is not None:
+        return int(row["seconds_until_reset"])
+    return None
+
+
 def build_routing_payload(
     snapshots: list[AccountSnapshot],
     history_by_provider: dict[str, list[dict[str, Any]]] | None = None,
     *,
     now: datetime | None = None,
     stale_after_seconds: int = DEFAULT_STALE_AFTER_SECONDS,
+    cooldowns: dict[str, dict[str, Any]] | None = None,
+    avoid_vendor: str | None = None,
+    vendors: Iterable[str] | None = None,
+    min_score: float | None = None,
 ) -> dict[str, Any]:
     current = _as_utc(now or utcnow())
     history_by_provider = history_by_provider or {}
+    cooldowns = cooldowns or {}
+    vendor_set = {v.strip() for v in vendors if v.strip()} if vendors else None
     by_id = {s.provider: s for s in snapshots}
 
     pools_out: dict[str, Any] = {}
     for pool_id, spec in POOLS.items():
         snap = by_id.get(spec["provider"])
+        cooldown = _cooldown_view(cooldowns, pool_id)
         if snap is None:
             pools_out[pool_id] = {
                 "provider": spec["provider"].value,
@@ -301,6 +352,7 @@ def build_routing_payload(
                 "score": None,
                 "level": "unknown",
                 "pace_penalty": False,
+                "cooldown": cooldown,
                 "message": "no snapshot",
             }
             continue
@@ -312,7 +364,11 @@ def build_routing_payload(
                 _find_window(snap.windows, key), slot=slot, key=key, rows=rows, now=current
             )
         scored = _score(windows, list(spec["slots"].keys()))
-        usable = snap.status.value == "ok" and scored["level"] not in {"critical", "unknown"}
+        usable = (
+            snap.status.value == "ok"
+            and scored["level"] not in {"critical", "unknown"}
+            and not cooldown["cooling"]
+        )
         pools_out[pool_id] = {
             "provider": spec["provider"].value,
             "display_name": spec["display_name"],
@@ -323,6 +379,7 @@ def build_routing_payload(
             "fetched_at": _iso(snap.fetched_at),
             "source": snap.source,
             "windows": windows,
+            "cooldown": cooldown,
             "message": snap.message,
             **scored,
         }
@@ -345,7 +402,12 @@ def build_routing_payload(
             "dispatchable": spec.get("dispatchable", True),
             "status": pool["status"],
             "stale": pool["stale"],
-            "usable": pool["status"] == "ok" and scored["level"] not in {"critical", "unknown"},
+            "usable": (
+                pool["status"] == "ok"
+                and scored["level"] not in {"critical", "unknown"}
+                and not pool["cooldown"]["cooling"]
+            ),
+            "cooldown": pool["cooldown"],
             "remaining_percent": binding["remaining_percent"] if binding else None,
             "seconds_until_reset": binding["seconds_until_reset"] if binding else None,
             "resets_at": binding["resets_at"] if binding else None,
@@ -354,31 +416,58 @@ def build_routing_payload(
             **scored,
         }
 
+    def _eligible(m: str) -> bool:
+        row = models_out[m]
+        if not row["usable"]:
+            return False
+        if avoid_vendor and row["vendor"] == avoid_vendor:
+            return False
+        if vendor_set is not None and row["vendor"] not in vendor_set:
+            return False
+        if min_score is not None and (row["score"] is None or row["score"] < min_score):
+            return False
+        return True
+
+    filters_active = bool(avoid_vendor) or vendor_set is not None or min_score is not None
+
     tiers_out: dict[str, Any] = {}
     for tier_id, spec in TIERS.items():
         ranked = sorted(
             (m for m in spec["candidates"] if m in models_out),
             key=lambda m: (
+                not _eligible(m),
                 not models_out[m]["usable"],
                 -(models_out[m]["score"] if models_out[m]["score"] is not None else -1.0),
                 -MODELS[m]["bench"],
                 MODELS[m]["cost_rank"],
             ),
         )
-        recommended = ranked[0] if ranked else None
+        eligible = [m for m in ranked if _eligible(m)]
+        recommended = eligible[0] if eligible else (ranked[0] if ranked else None)
         rec = models_out.get(recommended, {}) if recommended else {}
         usable_n = sum(1 for m in ranked if models_out[m]["usable"])
+        waits = [w for w in (_wait_seconds(models_out[m]) for m in ranked if m not in eligible) if w is not None]
+        wait = min(waits) if (waits and not eligible) else None
+        if eligible:
+            reason = (
+                f"{recommended} has the highest quota score ({rec.get('score')}) of {len(eligible)} eligible candidates"
+                f", strongest benchmark (bench {rec.get('bench')}) among equals"
+            )
+        elif usable_n and filters_active:
+            reason = "no candidate passes the caller's filters; static ladder should decide"
+        else:
+            reason = "no usable candidate; static ladder should decide"
+        if wait is not None:
+            reason += f"; earliest candidate back in {wait}s"
         tiers_out[tier_id] = {
             "role": spec["role"],
             "recommended": recommended,
             "vendor": rec.get("vendor"),
             "usable_candidates": usable_n,
-            "reason": (
-                f"{recommended} has the highest quota score ({rec.get('score')}) of {usable_n} usable candidates"
-                + f", strongest benchmark (bench {rec.get('bench')}) among equals"
-                if recommended and rec.get("usable")
-                else "no usable candidate; static ladder should decide"
-            ),
+            "eligible_candidates": len(eligible),
+            "next_available_at": _iso(current + timedelta(seconds=wait)) if wait is not None else None,
+            "wait_seconds": wait,
+            "reason": reason,
             "candidates": [
                 {
                     "model": m,
@@ -390,8 +479,11 @@ def build_routing_payload(
                     "score": models_out[m]["score"],
                     "level": models_out[m]["level"],
                     "usable": models_out[m]["usable"],
+                    "eligible": m in eligible,
+                    "cooling": models_out[m]["cooldown"]["cooling"],
                     "remaining_percent": models_out[m]["remaining_percent"],
                     "seconds_until_reset": models_out[m]["seconds_until_reset"],
+                    "wait_seconds": None if m in eligible else _wait_seconds(models_out[m]),
                 }
                 for m in ranked
             ],
@@ -400,12 +492,19 @@ def build_routing_payload(
     return {
         "server_time": _iso(current),
         "stale_after_seconds": stale_after_seconds,
+        "filters": {
+            "avoid_vendor": avoid_vendor or None,
+            "vendors": sorted(vendor_set) if vendor_set is not None else None,
+            "min_score": min_score,
+        },
         "algorithm": {
             "score": "binding window remaining % × 0.5 if pace exhausts it before reset",
             "level": {"critical_max": CRITICAL_REMAINING_PCT, "low_max": LOW_REMAINING_PCT},
-            "usable": "status == ok and level not in (critical, unknown)",
+            "usable": "status == ok and level not in (critical, unknown) and pool not cooling after dispatch feedback",
+            "eligible": "usable and passes avoid_vendor / vendors / min_score filters",
             "candidates": "every model whose max_tier covers the tier (review: reviewer models)",
-            "recommended": "highest quota score among usable candidates; bench (benchmark index) breaks ties, then cost_rank",
+            "recommended": "highest quota score among eligible candidates; bench (benchmark index) breaks ties, then cost_rank",
+            "wait_seconds": "when nothing is eligible: earliest cooldown end or window reset among candidates",
         },
         "pools": pools_out,
         "models": models_out,

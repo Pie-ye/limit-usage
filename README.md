@@ -194,9 +194,34 @@ orchestrating-development `dispatch` script knows (`claude`, `codex`, `grok`,
 | `windows.<slot>.burn_per_hour` | % of window consumed per hour, from recent history (2 h lookback for 5h windows, 24 h for weekly); `null` until there are ≥2 samples |
 | `windows.<slot>.will_last_until_reset` | `false` when the current pace empties the window before it resets; `projected_used_at_reset` gives the number |
 | `binding_slot` / `score` / `level` | Lowest-remaining window among the ones the model draws on; score = its remaining %, halved when the pace won't last; level `ok` / `low` (≤20 %) / `critical` (≤10 %) / `unknown` |
-| `usable` | `status == ok` and level not `critical` / `unknown` |
+| `usable` | `status == ok`, level not `critical` / `unknown`, and the pool is not `cooling` after dispatch feedback (below) |
+| `cooldown` | `{cooling, unavailable_until, seconds_left, backoff_level, kind, last_error}` from dispatch feedback; a cooling pool is never usable |
 | `stale` / `data_age_seconds` | Data older than `?stale_after=` seconds (default 900) |
-| `tiers.<T0..T3,review>.recommended` | Tier = task difficulty only; no model is pinned to a tier. `candidates` is every model whose `max_tier` covers the tier (review: reviewer models), ranked by quota `score`, then `bench` (benchmark index), then `cost_rank`; `recommended` is the top usable one and `reason` says why |
+| `tiers.<T0..T3,review>.recommended` | Tier = task difficulty only; no model is pinned to a tier. `candidates` is every model whose `max_tier` covers the tier (review: reviewer models), ranked by quota `score`, then `bench` (benchmark index), then `cost_rank`; `recommended` is the top **eligible** one and `reason` says why |
+| `tiers.*.candidates[].eligible` | `usable` **and** passes the caller's filters `?avoid_vendor=claude` (cross-vendor review), `?vendors=claude,codex` (Trellis channel can only spawn these CLIs), `?min_score=20` |
+| `tiers.*.wait_seconds` / `next_available_at` | Only when nothing is eligible: earliest cooldown end or window reset among the candidates, so the dispatcher can decide between waiting and its static ladder |
+
+**Dispatch feedback (9router-style cooldown).** The poller only sees a pool
+die at its next poll; a subagent that just hit a 429 knows now. `dispatch`
+therefore reports every outcome:
+
+```bash
+curl -X POST http://127.0.0.1:50048/api/routing/feedback \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-5.6-terra","status":429,"error":"rate limit reached"}'
+# → {"pool":"codex","kind":"rate_limit","cooldown_seconds":60,"backoff_level":1,...}
+curl -X POST ... -d '{"model":"gpt-5.6-terra","ok":true}'   # clears the cooldown
+curl http://127.0.0.1:50048/api/routing/feedback              # state + history per pool
+curl -X DELETE 'http://127.0.0.1:50048/api/routing/feedback?pool=codex'
+```
+
+Errors are classified text-first, then by status (`app/services/routing_feedback.py`
+`ERROR_RULES`): rate-limit wording or 429 → exponential backoff 60 s, 120 s, 240 s …;
+login / 401 / 402 / 403 → 5 min; malformed request → 5 s; anything else → 30 s.
+`retry_after_seconds` wins over the computed cooldown. Everything is capped at
+30 min (a codex `resets_at` five hours out must not lock the pool for the window)
+and a later, milder report never shortens an active cooldown. State is in
+memory; a restart clears it.
 
 `MODELS` in `app/services/routing_view.py` lists every model the four local
 CLIs expose with its pool, `max_tier` (set from published coding benchmarks),
@@ -213,9 +238,17 @@ Shell recipe for `dispatch`:
 ROUTING=http://127.0.0.1:50048/api/routing
 # pick the model for a tier, falling back automatically when the primary pool is critical
 read -r MODEL VENDOR < <(curl -sf "$ROUTING?tier=T2" | jq -r '"\(.recommended) \(.vendor)"')
+# reviewer that is not the implementer's vendor, with a score floor
+curl -sf "$ROUTING?tier=review&avoid_vendor=codex&min_score=20" | jq -r .recommended
 # or gate a specific model
 curl -sf "$ROUTING?model=claude-sonnet-5" | jq -e '.usable and (.score > 30)' >/dev/null || echo "sonnet pool low"
 ```
+
+Trellis: `orchestrating-development/scripts/route --tier T2 --format trellis`
+prints `--provider codex --model gpt-5.6-terra` for `trellis channel spawn`
+(it queries with `vendors=claude,codex` because the channel runtime only
+spawns those two CLIs); `route --role orchestrator` names the main-session
+model with the most quota.
 
 ## System Health and Backup Status Truth
 
