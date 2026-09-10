@@ -82,11 +82,19 @@ def test_tables_are_consistent():
         assert spec["pool"] in POOLS, model
         for slot in spec["slots"]:
             assert slot in POOLS[spec["pool"]]["slots"], (model, slot)
+        assert 0 <= spec["max_tier"] <= 3, model
+    assert len({spec["cost_rank"] for spec in MODELS.values()}) == len(MODELS)
     for tier, spec in TIERS.items():
-        assert spec["primary"] in MODELS, tier
-        assert spec["primary"] == spec["candidates"][0], tier
         for m in spec["candidates"]:
             assert m in MODELS, (tier, m)
+    # tier candidates are capability-filtered, not pinned
+    assert "gemini-3.8-flash-high" in TIERS["T1"]["candidates"]
+    assert "gemini-3.8-flash-high" not in TIERS["T2"]["candidates"]
+    assert set(TIERS["T3"]["candidates"]) == {"gpt-5.6-luna", "claude-opus-5"}
+    assert set(TIERS["review"]["candidates"]) == {"gpt-5.6-terra", "claude-opus-5"}
+    assert TIERS["T0"]["candidates"] == TIERS["T1"]["candidates"]
+    for tier in TIERS.values():
+        assert "claude-fable-5-1" not in tier["candidates"]
 
 
 def test_pools_windows_reset_and_binding():
@@ -131,30 +139,56 @@ def test_model_binding_ignores_fable_cap_for_sonnet():
     assert out["models"]["gemini-3.8-flash-high"]["vendor"] == "agy"
 
 
-def test_tiers_prefer_primary_when_usable():
+def test_tiers_rank_by_quota_score_then_cost():
     out = build_routing_payload(_all_ok(), now=NOW)
-    for tier, spec in TIERS.items():
-        row = out["tiers"][tier]
-        assert row["recommended"] == spec["primary"], tier
-        assert row["fallback_used"] is False
-        assert [c["model"] for c in row["candidates"]]  # non-empty, ranked
-        assert all(c["usable"] for c in row["candidates"])
+    # agy-3p 100 is not a model pool; codex 98 (5h) is the best real pool
+    t0 = out["tiers"]["T0"]
+    assert [c["model"] for c in t0["candidates"]][:2] == ["gpt-5.6-terra", "gpt-5.6-luna"]
+    assert t0["recommended"] == "gpt-5.6-terra"  # same score as luna, cheaper
+    assert t0["usable_candidates"] == 6
+    assert "highest quota score" in t0["reason"]
+    assert all(c["usable"] for c in t0["candidates"])
+    # T3 only admits max_tier 3 models
+    assert [c["model"] for c in out["tiers"]["T3"]["candidates"]] == ["gpt-5.6-luna", "claude-opus-5"]
+    assert out["tiers"]["review"]["recommended"] == "gpt-5.6-terra"
 
 
-def test_tier_falls_back_when_primary_critical():
-    snaps = _all_ok(claude_5h_used=95.0)  # sonnet binding = 5h → 5 % → critical
+def test_tier_skips_critical_models():
+    snaps = _all_ok(claude_5h_used=95.0)  # sonnet/opus binding = 5h → 5 % → critical
     out = build_routing_payload(snaps, now=NOW)
     assert out["models"]["claude-sonnet-5"]["level"] == "critical"
     assert out["models"]["claude-sonnet-5"]["usable"] is False
     t2 = out["tiers"]["T2"]
-    assert t2["fallback_used"] is True
-    assert t2["recommended"] == "gpt-5.6-terra"  # codex 98 % beats grok 72 %
+    assert t2["recommended"] == "gpt-5.6-terra"
     assert t2["vendor"] == "codex"
-    assert "critical" in t2["reason"]
-    # T0/T1 do not touch claude so they are unaffected
-    assert out["tiers"]["T0"]["recommended"] == "gemini-3.8-flash-high"
-    # opus shares the pool, so the review tier also falls back
+    # unusable models sort last regardless of cost
+    assert [c["model"] for c in t2["candidates"]][-2:] == ["claude-sonnet-5", "claude-opus-5"]
+    assert t2["usable_candidates"] == 3
+    assert out["tiers"]["T3"]["recommended"] == "gpt-5.6-luna"
     assert out["tiers"]["review"]["recommended"] == "gpt-5.6-terra"
+
+
+def test_tier_prefers_gemini_when_it_has_the_most_quota():
+    snaps = _all_ok()
+    snaps = [
+        _snap(ProviderId.CODEX, [_win("5h", 60, 13_000, 18000), _win("1w", 50, 600_000, 604800)])
+        if s.provider == ProviderId.CODEX else s
+        for s in snaps
+    ]
+    out = build_routing_payload(snaps, now=NOW)
+    assert out["tiers"]["T1"]["recommended"] == "gemini-3.8-flash-high"  # agy 78.42 beats grok 72
+    assert out["tiers"]["T2"]["recommended"] == "grok-4.6"  # gemini not eligible for T2
+    assert out["tiers"]["T3"]["recommended"] == "claude-opus-5"  # 71 beats codex 40
+
+
+def test_tier_with_no_usable_candidate():
+    snaps = [s for s in _all_ok() if s.provider not in {ProviderId.CODEX, ProviderId.CLAUDE}]
+    out = build_routing_payload(snaps, now=NOW)
+    t3 = out["tiers"]["T3"]
+    assert t3["usable_candidates"] == 0
+    assert t3["recommended"] in {"gpt-5.6-luna", "claude-opus-5"}
+    assert "no usable candidate" in t3["reason"]
+    assert all(not c["usable"] for c in t3["candidates"])
 
 
 def test_tier_falls_back_when_primary_not_ok_status():
@@ -166,7 +200,7 @@ def test_tier_falls_back_when_primary_not_ok_status():
     out = build_routing_payload(snaps, now=NOW)
     assert out["pools"]["codex"]["usable"] is False
     assert out["tiers"]["T3"]["recommended"] == "claude-opus-5"
-    assert "status=auth_error" in out["tiers"]["T3"]["reason"]
+    assert out["tiers"]["T3"]["candidates"][-1]["model"] == "gpt-5.6-luna"
 
 
 def test_missing_provider_is_unknown_and_unusable():
@@ -178,8 +212,7 @@ def test_missing_provider_is_unknown_and_unusable():
     assert grok["level"] == "unknown"
     assert out["models"]["grok-4.6"]["usable"] is False
     t1 = out["tiers"]["T1"]
-    assert t1["fallback_used"] is True
-    assert t1["recommended"] == "gemini-3.8-flash-high"
+    assert t1["recommended"] == "gpt-5.6-terra"
     # unusable candidates sort last
     assert t1["candidates"][-1]["model"] == "grok-4.6"
 
@@ -224,8 +257,8 @@ def test_burn_rate_and_pace_penalty():
     assert sonnet["pace_penalty"] is True
     assert sonnet["score"] == round(40.0 * PACE_PENALTY, 1)
     assert sonnet["level"] == "ok"  # penalty affects score, not level
-    # T2 primary is still usable (level ok), so it stays recommended
-    assert out["tiers"]["T2"]["recommended"] == "claude-sonnet-5"
+    # penalised sonnet (20) drops behind codex (98) and grok (72)
+    assert [c["model"] for c in out["tiers"]["T2"]["candidates"]][:2] == ["gpt-5.6-terra", "gpt-5.6-luna"]
 
 
 def test_burn_rate_idle_lasts_until_reset():

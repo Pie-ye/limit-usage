@@ -9,7 +9,7 @@ answers, per vendor CLI pool and per model id:
 * whether the current pace exhausts the window before it resets
   (``will_last_until_reset``, ``projected_used_at_reset``)
 * a single ``score`` (0–100) and ``level`` (ok/low/critical/unknown) per pool,
-  and a ``recommended`` model per dispatch tier.
+  and a ``recommended`` model per dispatch tier (tier = task difficulty).
 
 Scoring rule (deliberately simple so a shell caller can reason about it):
 
@@ -23,10 +23,10 @@ Scoring rule (deliberately simple so a shell caller can reason about it):
 5. ``level``: critical ≤ 10 %, low ≤ 20 %, unknown when no window data; the
    thresholds are shared with ``app.services.analytics``.
 
-Tier recommendation: the routing ladder's primary model unless its pool is
-``critical`` / not ``ok``; then the highest-scoring candidate in the tier's
-fallback list. ``candidates`` is always returned in score order so the caller
-can apply its own policy instead.
+Tier recommendation: no model is pinned to a tier. A tier's candidates are
+all models whose ``max_tier`` covers it; ``recommended`` is the usable one
+with the highest score (``cost_rank`` breaks ties). ``candidates`` is always
+returned in that order so the caller can apply its own policy instead.
 """
 
 from __future__ import annotations
@@ -85,50 +85,47 @@ POOLS: dict[str, dict[str, Any]] = {
     },
 }
 
-# Model id → pool and which slots it draws on. Fable has its own weekly cap on
-# top of the shared 5h / weekly windows; every other Claude model ignores it.
+# Model id → pool, the slots it draws on, the hardest tier it may take
+# (``max_tier``) and a cost rank used only as a tie-break (lower = cheaper).
+# Fable has its own weekly cap on top of the shared 5h / weekly windows; every
+# other Claude model ignores it. ``reviewer`` marks models strong enough to
+# review T2/T3 work.
 MODELS: dict[str, dict[str, Any]] = {
-    "claude-sonnet-5": {"pool": "claude", "slots": ["5h", "1w"]},
-    "claude-opus-5": {"pool": "claude", "slots": ["5h", "1w"]},
-    "claude-fable-5-1": {"pool": "claude", "slots": ["5h", "1w", "1w-fable"]},
-    "gpt-5.6-luna": {"pool": "codex", "slots": ["5h", "1w"]},
-    "gpt-5.6-terra": {"pool": "codex", "slots": ["5h", "1w"]},
-    "gpt-5.6-sol": {"pool": "codex", "slots": ["5h", "1w"]},
-    "grok-4.6": {"pool": "grok", "slots": ["1w"]},
-    "gemini-3.8-flash-high": {"pool": "agy", "slots": ["5h", "1w"]},
-    "gemini-3.8-pro": {"pool": "agy", "slots": ["5h", "1w"]},
+    "gemini-3.8-flash-high": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 0},
+    "grok-4.6": {"pool": "grok", "slots": ["1w"], "max_tier": 2, "cost_rank": 1},
+    "claude-sonnet-5": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 2},
+    "gpt-5.6-terra": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 3, "reviewer": True},
+    "gpt-5.6-luna": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 3, "cost_rank": 4},
+    "claude-opus-5": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 3, "cost_rank": 5, "reviewer": True},
+    # Orchestrator-only: reported under ``models`` for its Fable weekly cap,
+    # never offered as a dispatch candidate.
+    "claude-fable-5-1": {"pool": "claude", "slots": ["5h", "1w", "1w-fable"], "max_tier": 3, "cost_rank": 6, "dispatchable": False},
 }
 
-# Dispatch ladder from orchestrating-development/references/routing.md
-# (2026-09-08). ``primary`` is what ``dispatch --tier`` picks today; the rest of
-# ``candidates`` is the quota fallback order, one entry per vendor so a
-# fallback also changes eyes.
+# Tier = task difficulty score only (orchestrating-development P2: 0–2 T0,
+# 3–5 T1, 6–8 T2, 9–12 T3). No model is pinned to a tier: every model whose
+# ``max_tier`` covers the tier is a candidate, ranked by live quota score with
+# ``cost_rank`` as the tie-break. ``review`` only admits ``reviewer`` models;
+# the cross-vendor rule (reviewer ≠ implementer vendor) is applied by dispatch,
+# which knows who actually implemented.
+TIER_LEVELS = {"T0": 0, "T1": 1, "T2": 2, "T3": 3}
+
+
+def tier_candidates(tier_id: str) -> list[str]:
+    if tier_id == "review":
+        pool = [m for m, spec in MODELS.items() if spec.get("reviewer")]
+    else:
+        level = TIER_LEVELS[tier_id]
+        pool = [
+            m for m, spec in MODELS.items()
+            if spec["max_tier"] >= level and spec.get("dispatchable", True)
+        ]
+    return sorted(pool, key=lambda m: MODELS[m]["cost_rank"])
+
+
 TIERS: dict[str, dict[str, Any]] = {
-    "T0": {
-        "role": "implement",
-        "primary": "gemini-3.8-flash-high",
-        "candidates": ["gemini-3.8-flash-high", "grok-4.6", "claude-sonnet-5"],
-    },
-    "T1": {
-        "role": "implement",
-        "primary": "grok-4.6",
-        "candidates": ["grok-4.6", "gemini-3.8-flash-high", "claude-sonnet-5"],
-    },
-    "T2": {
-        "role": "implement",
-        "primary": "claude-sonnet-5",
-        "candidates": ["claude-sonnet-5", "gpt-5.6-terra", "grok-4.6"],
-    },
-    "T3": {
-        "role": "implement",
-        "primary": "gpt-5.6-luna",
-        "candidates": ["gpt-5.6-luna", "claude-opus-5"],
-    },
-    "review": {
-        "role": "review",
-        "primary": "claude-opus-5",
-        "candidates": ["claude-opus-5", "gpt-5.6-terra"],
-    },
+    **{t: {"role": "implement", "candidates": tier_candidates(t)} for t in TIER_LEVELS},
+    "review": {"role": "review", "candidates": tier_candidates("review")},
 }
 
 
@@ -330,35 +327,30 @@ def build_routing_payload(
         ranked = sorted(
             (m for m in spec["candidates"] if m in models_out),
             key=lambda m: (
-                models_out[m]["usable"],
-                models_out[m]["score"] if models_out[m]["score"] is not None else -1.0,
+                not models_out[m]["usable"],
+                -(models_out[m]["score"] if models_out[m]["score"] is not None else -1.0),
+                MODELS[m]["cost_rank"],
             ),
-            reverse=True,
         )
-        primary = spec["primary"]
-        primary_ok = primary in models_out and models_out[primary]["usable"]
-        recommended = primary if primary_ok else (ranked[0] if ranked else primary)
-        rec = models_out.get(recommended, {})
+        recommended = ranked[0] if ranked else None
+        rec = models_out.get(recommended, {}) if recommended else {}
+        usable_n = sum(1 for m in ranked if models_out[m]["usable"])
         tiers_out[tier_id] = {
             "role": spec["role"],
-            "primary": primary,
             "recommended": recommended,
             "vendor": rec.get("vendor"),
-            "fallback_used": recommended != primary,
+            "usable_candidates": usable_n,
             "reason": (
-                "primary usable"
-                if primary_ok
-                else f"primary {primary} is {models_out.get(primary, {}).get('level', 'missing')}"
-                + (
-                    f" (status={models_out[primary]['status']})"
-                    if primary in models_out and models_out[primary]["status"] != "ok"
-                    else ""
-                )
+                f"{recommended} has the highest quota score ({rec.get('score')}) of {usable_n} usable candidates"
+                if recommended and rec.get("usable")
+                else "no usable candidate; static ladder should decide"
             ),
             "candidates": [
                 {
                     "model": m,
                     "vendor": models_out[m]["vendor"],
+                    "max_tier": MODELS[m]["max_tier"],
+                    "cost_rank": MODELS[m]["cost_rank"],
                     "score": models_out[m]["score"],
                     "level": models_out[m]["level"],
                     "usable": models_out[m]["usable"],
@@ -376,7 +368,8 @@ def build_routing_payload(
             "score": "binding window remaining % × 0.5 if pace exhausts it before reset",
             "level": {"critical_max": CRITICAL_REMAINING_PCT, "low_max": LOW_REMAINING_PCT},
             "usable": "status == ok and level not in (critical, unknown)",
-            "recommended": "tier primary if usable, else highest-scoring usable candidate",
+            "candidates": "every model whose max_tier covers the tier (review: reviewer models)",
+            "recommended": "highest quota score among usable candidates; cost_rank breaks ties",
         },
         "pools": pools_out,
         "models": models_out,

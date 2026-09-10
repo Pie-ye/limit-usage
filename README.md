@@ -196,11 +196,12 @@ orchestrating-development `dispatch` script knows (`claude`, `codex`, `grok`,
 | `binding_slot` / `score` / `level` | Lowest-remaining window among the ones the model draws on; score = its remaining %, halved when the pace won't last; level `ok` / `low` (≤20 %) / `critical` (≤10 %) / `unknown` |
 | `usable` | `status == ok` and level not `critical` / `unknown` |
 | `stale` / `data_age_seconds` | Data older than `?stale_after=` seconds (default 900) |
-| `tiers.<T0..T3,review>.recommended` | The ladder's primary model if usable, else the best-scoring usable candidate; `candidates` is the ranked list and `fallback_used` / `reason` say why |
+| `tiers.<T0..T3,review>.recommended` | Tier = task difficulty only; no model is pinned to a tier. `candidates` is every model whose `max_tier` covers the tier (review: reviewer models), ranked by `score` with `cost_rank` as tie-break; `recommended` is the top usable one and `reason` says why |
 
-Model → pool mapping lives in `app/services/routing_view.py` (`MODELS`,
-`TIERS`); `claude-fable-5-1` additionally binds on the Fable weekly cap, the
-other Claude models ignore it. Filters: `?model=claude-sonnet-5` returns one
+Model → pool mapping, `max_tier` and `cost_rank` live in
+`app/services/routing_view.py` (`MODELS`); `claude-fable-5-1` additionally
+binds on the Fable weekly cap and is reported but never offered as a dispatch
+candidate. The cross-vendor review rule is applied by `dispatch`, not here. Filters: `?model=claude-sonnet-5` returns one
 model's row, `?tier=T2` one tier.
 
 Shell recipe for `dispatch`:
