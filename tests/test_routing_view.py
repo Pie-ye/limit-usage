@@ -98,6 +98,7 @@ def test_tables_are_consistent():
         assert "claude-fable-5-1" not in tier["candidates"]
     for m, spec in MODELS.items():
         assert spec["role"] in {"orchestrator", "subagent"}, m
+        assert 0 <= spec["bench"] <= 100, m
         if spec.get("reviewer"):
             assert spec["max_tier"] == 3, m
 
@@ -148,14 +149,15 @@ def test_model_binding_ignores_fable_cap_for_sonnet():
 def test_tiers_rank_by_quota_score_then_cost():
     out = build_routing_payload(_all_ok(), now=NOW)
     # agy-3p 100 is not a model pool; codex 98 (5h) is the best real pool,
-    # and within the codex pool the cheapest model wins the tie.
+    # and within the codex pool the strongest benchmark wins the tie.
     t0 = out["tiers"]["T0"]
-    assert t0["recommended"] == "gpt-reserve"
-    assert [c["model"] for c in t0["candidates"]][:2] == ["gpt-reserve", "gpt-5.6-luna"]
+    assert t0["recommended"] == "gpt-5.6-sol"
+    assert [c["model"] for c in t0["candidates"]][:3] == ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
     assert t0["usable_candidates"] == len(TIERS["T0"]["candidates"])
     assert "highest quota score" in t0["reason"]
     assert all(c["usable"] for c in t0["candidates"])
-    assert out["tiers"]["T1"]["recommended"] == "gpt-5.6-luna"  # gpt-reserve is T0-only
+    assert out["tiers"]["T1"]["recommended"] == "gpt-5.6-sol"
+    assert out["tiers"]["T2"]["recommended"] == "gpt-5.6-sol"
     # T3 only admits max_tier 3 models; codex sol (98) beats grok (72) and opus (71)
     assert [c["model"] for c in out["tiers"]["T3"]["candidates"]] == ["gpt-5.6-sol", "grok-4.6", "claude-opus-5"]
     assert out["tiers"]["review"]["recommended"] == "gpt-5.6-sol"
@@ -171,10 +173,10 @@ def test_tier_skips_critical_models():
     assert out["models"]["claude-sonnet-5"]["level"] == "critical"
     assert out["models"]["claude-sonnet-5"]["usable"] is False
     t2 = out["tiers"]["T2"]
-    assert t2["recommended"] == "gpt-5.6-luna"  # cheapest usable codex model
+    assert t2["recommended"] == "gpt-5.6-sol"  # strongest usable codex model
     assert t2["vendor"] == "codex"
     # unusable models sort last regardless of cost
-    assert [c["model"] for c in t2["candidates"]][-2:] == ["claude-sonnet-5", "claude-opus-5"]
+    assert [c["model"] for c in t2["candidates"]][-2:] == ["claude-opus-5", "claude-sonnet-5"]
     assert t2["usable_candidates"] == len(TIERS["T2"]["candidates"]) - 2
     assert out["tiers"]["T3"]["recommended"] == "gpt-5.6-sol"
     assert out["tiers"]["review"]["recommended"] == "gpt-5.6-sol"
@@ -188,9 +190,10 @@ def test_tier_prefers_gemini_when_it_has_the_most_quota():
         for s in snaps
     ]
     out = build_routing_payload(snaps, now=NOW)
-    assert out["tiers"]["T0"]["recommended"] == "gemini-3.8-flash-low"  # cheapest agy (78.42)
-    assert out["tiers"]["T1"]["recommended"] == "gemini-3.8-flash-medium"  # flash-low is T0-only
-    assert out["tiers"]["T2"]["recommended"] == "gemini-3.8-flash-high"  # T2-capable by benchmark
+    # agy (78.42) has the most quota; within it flash-high has the best bench
+    assert out["tiers"]["T0"]["recommended"] == "gemini-3.8-flash-high"
+    assert out["tiers"]["T1"]["recommended"] == "gemini-3.8-flash-high"
+    assert out["tiers"]["T2"]["recommended"] == "gemini-3.8-flash-high"
     assert out["tiers"]["T3"]["recommended"] == "grok-4.6"  # 72 beats opus 71 and codex 40
 
 
@@ -225,7 +228,7 @@ def test_missing_provider_is_unknown_and_unusable():
     assert grok["level"] == "unknown"
     assert out["models"]["grok-4.6"]["usable"] is False
     t1 = out["tiers"]["T1"]
-    assert t1["recommended"] == "gpt-5.6-luna"
+    assert t1["recommended"] == "gpt-5.6-sol"
     # unusable candidates sort last
     assert {c["model"] for c in t1["candidates"][-2:]} == {"grok-4.5", "grok-4.6"}
 
@@ -271,7 +274,7 @@ def test_burn_rate_and_pace_penalty():
     assert sonnet["score"] == round(40.0 * PACE_PENALTY, 1)
     assert sonnet["level"] == "ok"  # penalty affects score, not level
     # penalised sonnet (20) drops behind codex (98) and grok (72)
-    assert [c["model"] for c in out["tiers"]["T2"]["candidates"]][:2] == ["gpt-5.6-luna", "gpt-5.6-terra"]
+    assert [c["model"] for c in out["tiers"]["T2"]["candidates"]][:2] == ["gpt-5.6-sol", "gpt-5.6-terra"]
 
 
 def test_burn_rate_idle_lasts_until_reset():
@@ -288,3 +291,11 @@ def test_burn_rate_idle_lasts_until_reset():
     assert w["will_last_until_reset"] is True
     assert w["projected_used_at_reset"] == 2.0
     assert out["models"]["gpt-5.6-luna"]["pace_penalty"] is False
+
+
+def test_bench_breaks_quota_ties_before_cost():
+    out = build_routing_payload(_all_ok(), now=NOW)
+    codex = [c for c in out["tiers"]["T0"]["candidates"] if c["vendor"] == "codex"]
+    assert [c["score"] for c in codex] == [codex[0]["score"]] * len(codex)  # same pool, same score
+    assert [c["bench"] for c in codex] == sorted((c["bench"] for c in codex), reverse=True)
+    assert codex[-1]["model"] == "gpt-reserve"

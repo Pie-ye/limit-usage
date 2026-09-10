@@ -25,7 +25,8 @@ Scoring rule (deliberately simple so a shell caller can reason about it):
 
 Tier recommendation: no model is pinned to a tier. A tier's candidates are
 all models whose ``max_tier`` covers it; ``recommended`` is the usable one
-with the highest score (``cost_rank`` breaks ties). ``candidates`` is always
+with the highest quota score, then the highest ``bench`` (benchmark index)
+among equal scores, then the cheapest. ``candidates`` is always
 returned in that order so the caller can apply its own policy instead.
 """
 
@@ -93,7 +94,11 @@ POOLS: dict[str, dict[str, Any]] = {
 #              T2 ≈ SWE-bench Pro ~60–65 / Terminal-Bench 2.1 ≥ ~84
 #              T1 ≈ previous-gen or reduced-effort variants
 #              T0 ≈ no published coding benchmark, "fast and affordable"
-#   cost_rank  price order, cheapest first; only a tie-break within a score
+#   bench      composite coding-benchmark index (0–100, higher = stronger),
+#              derived from the same evidence as max_tier; used as the
+#              tie-break after quota score so equal-quota candidates (same
+#              pool) resolve to the strongest model, not the cheapest
+#   cost_rank  price order, cheapest first; last tie-break only
 #   role       "orchestrator" (may run the planning session; also dispatchable
 #              at its tier) or "subagent" (dispatch only)
 #   reviewer   strong enough to cross-review T2/T3 work
@@ -101,33 +106,33 @@ POOLS: dict[str, dict[str, Any]] = {
 # Evidence per row is in orchestrating-development references/routing.md.
 MODELS: dict[str, dict[str, Any]] = {
     # --- agy (Antigravity, gemini-* only) ---
-    "gemini-3.8-flash-low": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 0, "cost_rank": 0, "role": "subagent"},
-    "gemini-3.8-flash-medium": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 1, "role": "subagent"},
-    "gemini-3.8-flash-high": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 2, "role": "subagent"},
-    "gemini-3.1-pro-low": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 5, "role": "subagent"},
-    "gemini-3.1-pro-high": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 6, "role": "subagent"},
+    "gemini-3.8-flash-low": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 0, "cost_rank": 0, "bench": 55, "role": "subagent"},
+    "gemini-3.8-flash-medium": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 1, "bench": 70, "role": "subagent"},
+    "gemini-3.8-flash-high": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 2, "bench": 81, "role": "subagent"},
+    "gemini-3.1-pro-low": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 5, "bench": 65, "role": "subagent"},
+    "gemini-3.1-pro-high": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 6, "bench": 74, "role": "subagent"},
     # --- codex ---
-    "gpt-reserve": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 0, "cost_rank": 3, "role": "subagent"},
-    "gpt-5.6-luna": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 7, "role": "subagent"},
-    "gpt-5.5": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 9, "role": "subagent"},
-    "gpt-5.6-terra": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 12, "role": "subagent"},
-    "gpt-5.6-sol": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 3, "cost_rank": 13, "role": "orchestrator", "reviewer": True},
+    "gpt-reserve": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 0, "cost_rank": 3, "bench": 50, "role": "subagent"},
+    "gpt-5.6-luna": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 7, "bench": 78, "role": "subagent"},
+    "gpt-5.5": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 9, "bench": 72, "role": "subagent"},
+    "gpt-5.6-terra": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 12, "bench": 82, "role": "subagent"},
+    "gpt-5.6-sol": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 3, "cost_rank": 13, "bench": 90, "role": "orchestrator", "reviewer": True},
     # --- grok ---
-    "grok-4.5": {"pool": "grok", "slots": ["1w"], "max_tier": 2, "cost_rank": 8, "role": "subagent"},
-    "grok-4.6": {"pool": "grok", "slots": ["1w"], "max_tier": 3, "cost_rank": 10, "role": "orchestrator", "reviewer": True},
+    "grok-4.5": {"pool": "grok", "slots": ["1w"], "max_tier": 2, "cost_rank": 8, "bench": 77, "role": "subagent"},
+    "grok-4.6": {"pool": "grok", "slots": ["1w"], "max_tier": 3, "cost_rank": 10, "bench": 86, "role": "orchestrator", "reviewer": True},
     # --- claude ---
-    "claude-haiku-4-5-20251001": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 4, "role": "subagent"},
-    "claude-sonnet-5": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 11, "role": "subagent"},
-    "claude-opus-5": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 3, "cost_rank": 14, "role": "orchestrator", "reviewer": True},
+    "claude-haiku-4-5-20251001": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 4, "bench": 60, "role": "subagent"},
+    "claude-sonnet-5": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 11, "bench": 80, "role": "subagent"},
+    "claude-opus-5": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 3, "cost_rank": 14, "bench": 92, "role": "orchestrator", "reviewer": True},
     # Orchestrator-only: reported under ``models`` for its Fable weekly cap,
     # never offered as a dispatch candidate (it would burn the planner's cap).
-    "claude-fable-5-1": {"pool": "claude", "slots": ["5h", "1w", "1w-fable"], "max_tier": 3, "cost_rank": 15, "role": "orchestrator", "dispatchable": False},
+    "claude-fable-5-1": {"pool": "claude", "slots": ["5h", "1w", "1w-fable"], "max_tier": 3, "cost_rank": 15, "bench": 95, "role": "orchestrator", "dispatchable": False},
 }
 
 # Tier = task difficulty score only (orchestrating-development P2: 0–2 T0,
 # 3–5 T1, 6–8 T2, 9–12 T3). No model is pinned to a tier: every model whose
-# ``max_tier`` covers the tier is a candidate, ranked by live quota score with
-# ``cost_rank`` as the tie-break. ``review`` only admits ``reviewer`` models;
+# ``max_tier`` covers the tier is a candidate, ranked by live quota score,
+# then ``bench``, then ``cost_rank``. ``review`` only admits ``reviewer`` models;
 # the cross-vendor rule (reviewer ≠ implementer vendor) is applied by dispatch,
 # which knows who actually implemented.
 TIER_LEVELS = {"T0": 0, "T1": 1, "T2": 2, "T3": 3}
@@ -335,6 +340,7 @@ def build_routing_payload(
             "slots": spec["slots"],
             "role": spec["role"],
             "max_tier": spec["max_tier"],
+            "bench": spec["bench"],
             "cost_rank": spec["cost_rank"],
             "dispatchable": spec.get("dispatchable", True),
             "status": pool["status"],
@@ -355,6 +361,7 @@ def build_routing_payload(
             key=lambda m: (
                 not models_out[m]["usable"],
                 -(models_out[m]["score"] if models_out[m]["score"] is not None else -1.0),
+                -MODELS[m]["bench"],
                 MODELS[m]["cost_rank"],
             ),
         )
@@ -368,6 +375,7 @@ def build_routing_payload(
             "usable_candidates": usable_n,
             "reason": (
                 f"{recommended} has the highest quota score ({rec.get('score')}) of {usable_n} usable candidates"
+                + f", strongest benchmark (bench {rec.get('bench')}) among equals"
                 if recommended and rec.get("usable")
                 else "no usable candidate; static ladder should decide"
             ),
@@ -377,6 +385,7 @@ def build_routing_payload(
                     "vendor": models_out[m]["vendor"],
                     "role": MODELS[m]["role"],
                     "max_tier": MODELS[m]["max_tier"],
+                    "bench": MODELS[m]["bench"],
                     "cost_rank": MODELS[m]["cost_rank"],
                     "score": models_out[m]["score"],
                     "level": models_out[m]["level"],
@@ -396,7 +405,7 @@ def build_routing_payload(
             "level": {"critical_max": CRITICAL_REMAINING_PCT, "low_max": LOW_REMAINING_PCT},
             "usable": "status == ok and level not in (critical, unknown)",
             "candidates": "every model whose max_tier covers the tier (review: reviewer models)",
-            "recommended": "highest quota score among usable candidates; cost_rank breaks ties",
+            "recommended": "highest quota score among usable candidates; bench (benchmark index) breaks ties, then cost_rank",
         },
         "pools": pools_out,
         "models": models_out,
@@ -405,6 +414,7 @@ def build_routing_payload(
             key=lambda m: (
                 not models_out[m]["usable"],
                 -(models_out[m]["score"] if models_out[m]["score"] is not None else -1.0),
+                -MODELS[m]["bench"],
                 MODELS[m]["cost_rank"],
             ),
         ),
