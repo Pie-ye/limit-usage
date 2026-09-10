@@ -85,21 +85,43 @@ POOLS: dict[str, dict[str, Any]] = {
     },
 }
 
-# Model id → pool, the slots it draws on, the hardest tier it may take
-# (``max_tier``) and a cost rank used only as a tie-break (lower = cheaper).
-# Fable has its own weekly cap on top of the shared 5h / weekly windows; every
-# other Claude model ignores it. ``reviewer`` marks models strong enough to
-# review T2/T3 work.
+# Every model the four local CLIs expose (claude / codex / grok / agy), with:
+#   pool       quota pool it draws on
+#   slots      which windows bind it
+#   max_tier   hardest tier it may take, set from benchmarks (2026-09-10):
+#              T3 ≈ SWE-bench Pro ≥ ~65 or Terminal-Bench 4.0 top group
+#              T2 ≈ SWE-bench Pro ~60–65 / Terminal-Bench 2.1 ≥ ~84
+#              T1 ≈ previous-gen or reduced-effort variants
+#              T0 ≈ no published coding benchmark, "fast and affordable"
+#   cost_rank  price order, cheapest first; only a tie-break within a score
+#   role       "orchestrator" (may run the planning session; also dispatchable
+#              at its tier) or "subagent" (dispatch only)
+#   reviewer   strong enough to cross-review T2/T3 work
+#   dispatchable=False  reported for its quota but never handed to dispatch
+# Evidence per row is in orchestrating-development references/routing.md.
 MODELS: dict[str, dict[str, Any]] = {
-    "gemini-3.8-flash-high": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 0},
-    "grok-4.6": {"pool": "grok", "slots": ["1w"], "max_tier": 2, "cost_rank": 1},
-    "claude-sonnet-5": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 2},
-    "gpt-5.6-terra": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 3, "reviewer": True},
-    "gpt-5.6-luna": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 3, "cost_rank": 4},
-    "claude-opus-5": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 3, "cost_rank": 5, "reviewer": True},
+    # --- agy (Antigravity, gemini-* only) ---
+    "gemini-3.8-flash-low": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 0, "cost_rank": 0, "role": "subagent"},
+    "gemini-3.8-flash-medium": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 1, "role": "subagent"},
+    "gemini-3.8-flash-high": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 2, "role": "subagent"},
+    "gemini-3.1-pro-low": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 5, "role": "subagent"},
+    "gemini-3.1-pro-high": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 6, "role": "subagent"},
+    # --- codex ---
+    "gpt-reserve": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 0, "cost_rank": 3, "role": "subagent"},
+    "gpt-5.6-luna": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 7, "role": "subagent"},
+    "gpt-5.5": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 9, "role": "subagent"},
+    "gpt-5.6-terra": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 12, "role": "subagent"},
+    "gpt-5.6-sol": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 3, "cost_rank": 13, "role": "orchestrator", "reviewer": True},
+    # --- grok ---
+    "grok-4.5": {"pool": "grok", "slots": ["1w"], "max_tier": 2, "cost_rank": 8, "role": "subagent"},
+    "grok-4.6": {"pool": "grok", "slots": ["1w"], "max_tier": 3, "cost_rank": 10, "role": "orchestrator", "reviewer": True},
+    # --- claude ---
+    "claude-haiku-4-5-20251001": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 4, "role": "subagent"},
+    "claude-sonnet-5": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 11, "role": "subagent"},
+    "claude-opus-5": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 3, "cost_rank": 14, "role": "orchestrator", "reviewer": True},
     # Orchestrator-only: reported under ``models`` for its Fable weekly cap,
-    # never offered as a dispatch candidate.
-    "claude-fable-5-1": {"pool": "claude", "slots": ["5h", "1w", "1w-fable"], "max_tier": 3, "cost_rank": 6, "dispatchable": False},
+    # never offered as a dispatch candidate (it would burn the planner's cap).
+    "claude-fable-5-1": {"pool": "claude", "slots": ["5h", "1w", "1w-fable"], "max_tier": 3, "cost_rank": 15, "role": "orchestrator", "dispatchable": False},
 }
 
 # Tier = task difficulty score only (orchestrating-development P2: 0–2 T0,
@@ -311,6 +333,10 @@ def build_routing_payload(
             "vendor": spec["pool"].split("-", 1)[0],
             "pool": spec["pool"],
             "slots": spec["slots"],
+            "role": spec["role"],
+            "max_tier": spec["max_tier"],
+            "cost_rank": spec["cost_rank"],
+            "dispatchable": spec.get("dispatchable", True),
             "status": pool["status"],
             "stale": pool["stale"],
             "usable": pool["status"] == "ok" and scored["level"] not in {"critical", "unknown"},
@@ -349,6 +375,7 @@ def build_routing_payload(
                 {
                     "model": m,
                     "vendor": models_out[m]["vendor"],
+                    "role": MODELS[m]["role"],
                     "max_tier": MODELS[m]["max_tier"],
                     "cost_rank": MODELS[m]["cost_rank"],
                     "score": models_out[m]["score"],
@@ -373,5 +400,13 @@ def build_routing_payload(
         },
         "pools": pools_out,
         "models": models_out,
+        "orchestrators": sorted(
+            (m for m, spec in MODELS.items() if spec["role"] == "orchestrator" and m in models_out),
+            key=lambda m: (
+                not models_out[m]["usable"],
+                -(models_out[m]["score"] if models_out[m]["score"] is not None else -1.0),
+                MODELS[m]["cost_rank"],
+            ),
+        ),
         "tiers": tiers_out,
     }

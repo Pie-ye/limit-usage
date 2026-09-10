@@ -88,13 +88,18 @@ def test_tables_are_consistent():
         for m in spec["candidates"]:
             assert m in MODELS, (tier, m)
     # tier candidates are capability-filtered, not pinned
-    assert "gemini-3.8-flash-high" in TIERS["T1"]["candidates"]
-    assert "gemini-3.8-flash-high" not in TIERS["T2"]["candidates"]
-    assert set(TIERS["T3"]["candidates"]) == {"gpt-5.6-luna", "claude-opus-5"}
-    assert set(TIERS["review"]["candidates"]) == {"gpt-5.6-terra", "claude-opus-5"}
-    assert TIERS["T0"]["candidates"] == TIERS["T1"]["candidates"]
+    assert "gemini-3.8-flash-high" in TIERS["T2"]["candidates"]
+    assert "gemini-3.8-flash-high" not in TIERS["T3"]["candidates"]
+    assert "gemini-3.8-flash-low" not in TIERS["T1"]["candidates"]
+    assert set(TIERS["T3"]["candidates"]) == {"gpt-5.6-sol", "grok-4.6", "claude-opus-5"}
+    assert set(TIERS["review"]["candidates"]) == {"gpt-5.6-sol", "grok-4.6", "claude-opus-5"}
+    assert set(TIERS["T1"]["candidates"]) < set(TIERS["T0"]["candidates"])
     for tier in TIERS.values():
         assert "claude-fable-5-1" not in tier["candidates"]
+    for m, spec in MODELS.items():
+        assert spec["role"] in {"orchestrator", "subagent"}, m
+        if spec.get("reviewer"):
+            assert spec["max_tier"] == 3, m
 
 
 def test_pools_windows_reset_and_binding():
@@ -137,20 +142,27 @@ def test_model_binding_ignores_fable_cap_for_sonnet():
     assert fable["remaining_percent"] == 64.0
     assert out["models"]["grok-4.6"]["pool"] == "grok"
     assert out["models"]["gemini-3.8-flash-high"]["vendor"] == "agy"
+    assert out["models"]["gpt-5.6-sol"]["role"] == "orchestrator"
 
 
 def test_tiers_rank_by_quota_score_then_cost():
     out = build_routing_payload(_all_ok(), now=NOW)
-    # agy-3p 100 is not a model pool; codex 98 (5h) is the best real pool
+    # agy-3p 100 is not a model pool; codex 98 (5h) is the best real pool,
+    # and within the codex pool the cheapest model wins the tie.
     t0 = out["tiers"]["T0"]
-    assert [c["model"] for c in t0["candidates"]][:2] == ["gpt-5.6-terra", "gpt-5.6-luna"]
-    assert t0["recommended"] == "gpt-5.6-terra"  # same score as luna, cheaper
-    assert t0["usable_candidates"] == 6
+    assert t0["recommended"] == "gpt-reserve"
+    assert [c["model"] for c in t0["candidates"]][:2] == ["gpt-reserve", "gpt-5.6-luna"]
+    assert t0["usable_candidates"] == len(TIERS["T0"]["candidates"])
     assert "highest quota score" in t0["reason"]
     assert all(c["usable"] for c in t0["candidates"])
-    # T3 only admits max_tier 3 models
-    assert [c["model"] for c in out["tiers"]["T3"]["candidates"]] == ["gpt-5.6-luna", "claude-opus-5"]
-    assert out["tiers"]["review"]["recommended"] == "gpt-5.6-terra"
+    assert out["tiers"]["T1"]["recommended"] == "gpt-5.6-luna"  # gpt-reserve is T0-only
+    # T3 only admits max_tier 3 models; codex sol (98) beats grok (72) and opus (71)
+    assert [c["model"] for c in out["tiers"]["T3"]["candidates"]] == ["gpt-5.6-sol", "grok-4.6", "claude-opus-5"]
+    assert out["tiers"]["review"]["recommended"] == "gpt-5.6-sol"
+    assert out["orchestrators"][0] == "gpt-5.6-sol"
+    assert set(out["orchestrators"]) == {"gpt-5.6-sol", "grok-4.6", "claude-opus-5", "claude-fable-5-1"}
+    assert out["models"]["claude-fable-5-1"]["dispatchable"] is False
+    assert out["models"]["gpt-reserve"]["role"] == "subagent"
 
 
 def test_tier_skips_critical_models():
@@ -159,13 +171,13 @@ def test_tier_skips_critical_models():
     assert out["models"]["claude-sonnet-5"]["level"] == "critical"
     assert out["models"]["claude-sonnet-5"]["usable"] is False
     t2 = out["tiers"]["T2"]
-    assert t2["recommended"] == "gpt-5.6-terra"
+    assert t2["recommended"] == "gpt-5.6-luna"  # cheapest usable codex model
     assert t2["vendor"] == "codex"
     # unusable models sort last regardless of cost
     assert [c["model"] for c in t2["candidates"]][-2:] == ["claude-sonnet-5", "claude-opus-5"]
-    assert t2["usable_candidates"] == 3
-    assert out["tiers"]["T3"]["recommended"] == "gpt-5.6-luna"
-    assert out["tiers"]["review"]["recommended"] == "gpt-5.6-terra"
+    assert t2["usable_candidates"] == len(TIERS["T2"]["candidates"]) - 2
+    assert out["tiers"]["T3"]["recommended"] == "gpt-5.6-sol"
+    assert out["tiers"]["review"]["recommended"] == "gpt-5.6-sol"
 
 
 def test_tier_prefers_gemini_when_it_has_the_most_quota():
@@ -176,17 +188,18 @@ def test_tier_prefers_gemini_when_it_has_the_most_quota():
         for s in snaps
     ]
     out = build_routing_payload(snaps, now=NOW)
-    assert out["tiers"]["T1"]["recommended"] == "gemini-3.8-flash-high"  # agy 78.42 beats grok 72
-    assert out["tiers"]["T2"]["recommended"] == "grok-4.6"  # gemini not eligible for T2
-    assert out["tiers"]["T3"]["recommended"] == "claude-opus-5"  # 71 beats codex 40
+    assert out["tiers"]["T0"]["recommended"] == "gemini-3.8-flash-low"  # cheapest agy (78.42)
+    assert out["tiers"]["T1"]["recommended"] == "gemini-3.8-flash-medium"  # flash-low is T0-only
+    assert out["tiers"]["T2"]["recommended"] == "gemini-3.8-flash-high"  # T2-capable by benchmark
+    assert out["tiers"]["T3"]["recommended"] == "grok-4.6"  # 72 beats opus 71 and codex 40
 
 
 def test_tier_with_no_usable_candidate():
-    snaps = [s for s in _all_ok() if s.provider not in {ProviderId.CODEX, ProviderId.CLAUDE}]
+    snaps = [s for s in _all_ok() if s.provider not in {ProviderId.CODEX, ProviderId.CLAUDE, ProviderId.SUPERGROK}]
     out = build_routing_payload(snaps, now=NOW)
     t3 = out["tiers"]["T3"]
     assert t3["usable_candidates"] == 0
-    assert t3["recommended"] in {"gpt-5.6-luna", "claude-opus-5"}
+    assert t3["recommended"] in {"gpt-5.6-sol", "grok-4.6", "claude-opus-5"}
     assert "no usable candidate" in t3["reason"]
     assert all(not c["usable"] for c in t3["candidates"])
 
@@ -199,8 +212,8 @@ def test_tier_falls_back_when_primary_not_ok_status():
     ]
     out = build_routing_payload(snaps, now=NOW)
     assert out["pools"]["codex"]["usable"] is False
-    assert out["tiers"]["T3"]["recommended"] == "claude-opus-5"
-    assert out["tiers"]["T3"]["candidates"][-1]["model"] == "gpt-5.6-luna"
+    assert out["tiers"]["T3"]["recommended"] == "grok-4.6"
+    assert out["tiers"]["T3"]["candidates"][-1]["model"] == "gpt-5.6-sol"
 
 
 def test_missing_provider_is_unknown_and_unusable():
@@ -212,9 +225,9 @@ def test_missing_provider_is_unknown_and_unusable():
     assert grok["level"] == "unknown"
     assert out["models"]["grok-4.6"]["usable"] is False
     t1 = out["tiers"]["T1"]
-    assert t1["recommended"] == "gpt-5.6-terra"
+    assert t1["recommended"] == "gpt-5.6-luna"
     # unusable candidates sort last
-    assert t1["candidates"][-1]["model"] == "grok-4.6"
+    assert {c["model"] for c in t1["candidates"][-2:]} == {"grok-4.5", "grok-4.6"}
 
 
 def test_stale_flag_uses_threshold():
@@ -258,7 +271,7 @@ def test_burn_rate_and_pace_penalty():
     assert sonnet["score"] == round(40.0 * PACE_PENALTY, 1)
     assert sonnet["level"] == "ok"  # penalty affects score, not level
     # penalised sonnet (20) drops behind codex (98) and grok (72)
-    assert [c["model"] for c in out["tiers"]["T2"]["candidates"]][:2] == ["gpt-5.6-terra", "gpt-5.6-luna"]
+    assert [c["model"] for c in out["tiers"]["T2"]["candidates"]][:2] == ["gpt-5.6-luna", "gpt-5.6-terra"]
 
 
 def test_burn_rate_idle_lasts_until_reset():

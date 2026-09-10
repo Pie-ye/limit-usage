@@ -198,10 +198,13 @@ orchestrating-development `dispatch` script knows (`claude`, `codex`, `grok`,
 | `stale` / `data_age_seconds` | Data older than `?stale_after=` seconds (default 900) |
 | `tiers.<T0..T3,review>.recommended` | Tier = task difficulty only; no model is pinned to a tier. `candidates` is every model whose `max_tier` covers the tier (review: reviewer models), ranked by `score` with `cost_rank` as tie-break; `recommended` is the top usable one and `reason` says why |
 
-Model → pool mapping, `max_tier` and `cost_rank` live in
-`app/services/routing_view.py` (`MODELS`); `claude-fable-5-1` additionally
-binds on the Fable weekly cap and is reported but never offered as a dispatch
-candidate. The cross-vendor review rule is applied by `dispatch`, not here. Filters: `?model=claude-sonnet-5` returns one
+`MODELS` in `app/services/routing_view.py` lists every model the four local
+CLIs expose with its pool, `max_tier` (set from published coding benchmarks),
+`cost_rank` and `role` (`orchestrator` models may run the planning session and
+are listed quota-ranked under `orchestrators`; `subagent` models are dispatch
+only). `claude-fable-5-1` additionally binds on the Fable weekly cap and is
+reported but never offered as a dispatch candidate. The cross-vendor review
+rule is applied by `dispatch`, not here. Filters: `?model=claude-sonnet-5` returns one
 model's row, `?tier=T2` one tier.
 
 Shell recipe for `dispatch`:
