@@ -1,0 +1,24 @@
+[Unit]
+Description=Push this machine's Claude usage readings to limit-usage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Claude quota is account-wide but every file carrying it is per-machine, so a
+# host that runs Claude Code has to tell the limit-usage host what it burned —
+# otherwise the card, and the /api/routing scores built on it, stay optimistic
+# and keep routing work at a pool that is already spent.
+#
+# Set LIMIT_USAGE_URL to the limit-usage host. Over the tailnet that is enough;
+# through the Cloudflare tunnel, also set the Access service-token pair. Put
+# both in an EnvironmentFile with mode 600 rather than inline here — this unit
+# is world-readable.
+Environment=LIMIT_USAGE_URL=http://100.64.128.70:50048
+EnvironmentFile=-%h/.config/limit-usage/push.env
+ExecStart=/usr/bin/python3 %h/Container/limit-usage/deploy/claude-usage-push.py
+StandardOutput=null
+TimeoutStartSec=60
+
+[Install]
+WantedBy=default.target

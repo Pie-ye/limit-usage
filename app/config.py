@@ -35,6 +35,13 @@ class Settings(BaseSettings):
     claude_usage_cache_path: str = "~/.claude-monitor/state/claude-code-usage.json"
     claude_official_max_age_seconds: int = Field(default=21600, ge=60)
     claude_oauth_min_interval_seconds: int = Field(default=1800, ge=60)
+    # Claude Code appends to these transcripts once per API response, including
+    # from headless / ACP / subagent sessions. Used only as an "is anyone
+    # spending quota right now" signal to pace the OAuth fallback — never to
+    # derive a percentage, which these files cannot support.
+    claude_projects_dir: str = "~/.claude/projects"
+    claude_oauth_active_interval_seconds: int = Field(default=180, ge=60)
+    claude_activity_window_seconds: int = Field(default=900, ge=60)
 
     http_timeout_seconds: float = 20.0
     max_backoff_seconds: int = 900
@@ -68,6 +75,13 @@ class Settings(BaseSettings):
         return (
             expand_path(self.claude_statusline_capture_path)
             or Path.home() / ".claude-monitor" / "statusline" / "latest.json"
+        )
+
+    @property
+    def claude_projects(self) -> Path:
+        return (
+            expand_path(self.claude_projects_dir)
+            or Path.home() / ".claude" / "projects"
         )
 
     @property

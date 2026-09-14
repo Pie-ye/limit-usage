@@ -1,0 +1,16 @@
+[Unit]
+Description=Push Claude usage readings to limit-usage every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+# Matches the local cache-sync cadence. The push is a couple of KB and the
+# server keeps only the newest reading per host, so a missed run costs nothing
+# beyond that interval — but the gap must stay far below
+# CLAUDE_OFFICIAL_MAX_AGE_SECONDS (default 21600) or this timer becomes the
+# reason a remote reading ages out.
+AccuracySec=15s
+Unit=limit-usage-claude-push.service
+
+[Install]
+WantedBy=timers.target

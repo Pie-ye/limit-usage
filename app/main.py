@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.db.repository import Repository
 from app.providers.registry import build_providers
 from app.services.poller import UsagePoller
+from app.services.remote_claude import RemoteClaudeRegistry
 from app.services.routing_feedback import FeedbackRegistry
 
 logging.basicConfig(
@@ -39,11 +40,26 @@ class RoutingFeedback(BaseModel):
     retry_after_seconds: float | None = None
 
 
+class ClaudeIngest(BaseModel):
+    """One machine's copy of the two files ClaudeProvider already reads.
+
+    The wire format is the files themselves, so a push agent is a `cat` and the
+    server reuses its existing parsers — there is no third schema to keep in
+    sync. Both are optional: a host may have a statusline capture but no usage
+    cache, or vice versa.
+    """
+
+    host: str
+    statusline: dict | None = None
+    usage_cache: dict | None = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     repo = Repository(settings.db_path)
-    providers = build_providers(settings)
+    remote_claude = RemoteClaudeRegistry()
+    providers = build_providers(settings, remote_claude=remote_claude)
     poller = UsagePoller(
         providers,
         repo,
@@ -55,6 +71,7 @@ async def lifespan(app: FastAPI):
     app.state.repository = repo
     app.state.poller = poller
     app.state.routing_feedback = FeedbackRegistry()
+    app.state.remote_claude = remote_claude
     poller.start()
     logger.info(
         "limit-usage v%s listening config port=%s db=%s",
@@ -307,6 +324,41 @@ def create_app() -> FastAPI:
         feedback: FeedbackRegistry = request.app.state.routing_feedback
         feedback.clear(pool)
         return {"cleared": pool or "all"}
+
+    @api.post("/ingest/claude")
+    async def ingest_claude(request: Request, body: ClaudeIngest):
+        """Accept another machine's Claude usage files.
+
+        Claude quota is account-wide but every source of it is per-machine, so a
+        host doing the actual work holds a fresher reading than this one. The
+        payload is merged by observation time, not arrival time, so an out-of-order
+        or delayed push cannot overwrite a newer reading.
+        """
+        from fastapi import HTTPException
+
+        registry: RemoteClaudeRegistry = request.app.state.remote_claude
+        try:
+            result = registry.report(
+                body.host,
+                {"statusline": body.statusline, "usage_cache": body.usage_cache},
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        logger.info("claude ingest host=%s kinds=%s", result["host"], result["accepted"])
+        return result
+
+    @api.get("/ingest/claude")
+    async def ingest_claude_state(request: Request):
+        """Which hosts have pushed, and when — for debugging a silent push agent."""
+        registry: RemoteClaudeRegistry = request.app.state.remote_claude
+        return registry.snapshot()
+
+    @api.delete("/ingest/claude")
+    async def ingest_claude_clear(request: Request, host: str | None = None):
+        """Drop pushed readings (one host, or all). A decommissioned machine
+        otherwise keeps a reading alive until it ages out."""
+        registry: RemoteClaudeRegistry = request.app.state.remote_claude
+        return {"cleared": host or "all", "removed": registry.clear(host)}
 
     @api.get("/host/ups")
     async def host_ups():

@@ -31,6 +31,13 @@ USAGE_CACHE_SOURCE = "claude-code-cache"
 OAUTH_SOURCE = "oauth/usage"
 LOCAL_MIN_INTERVAL_SECONDS = 60
 DEFAULT_OAUTH_MIN_INTERVAL_SECONDS = 1800
+# Spacing used while Claude Code is demonstrably working on this machine. The
+# wide idle interval exists to protect a per-account rate limit shared with every
+# other session on the account; but the number only moves while quota is being
+# spent, so paying the call rate then — and only then — buys most of the
+# freshness for a fraction of the requests. Still well above the ~1/min the
+# endpoint tolerates from a single caller.
+DEFAULT_OAUTH_ACTIVE_INTERVAL_SECONDS = 180
 OFFICIAL_MAX_AGE_SECONDS = 21600
 FRESH_MESSAGE_THRESHOLD_SECONDS = 900
 FIVE_HOUR_SECONDS = 18000
@@ -405,11 +412,21 @@ def merge_official_windows(
         max(contributing_observations.values()) if contributing_observations else None
     )
 
+    # Locals first in a fixed order, then any pushed hosts sorted by name, so the
+    # card's ``source`` string is stable across polls and names the machine whose
+    # reading actually won — without that, a number arriving from another host
+    # is indistinguishable from a local one when you are trying to work out why
+    # the percentage jumped.
     contributing_sources = [
         source
         for source in (STATUSLINE_SOURCE, USAGE_CACHE_SOURCE)
         if source in contributing
     ]
+    contributing_sources += sorted(
+        source
+        for source in contributing
+        if source not in (STATUSLINE_SOURCE, USAGE_CACHE_SOURCE)
+    )
     return windows, contributing_sources, newest_observed_at
 
 
@@ -455,13 +472,23 @@ class ClaudeProvider:
         usage_cache_path: Path | None = None,
         official_max_age_seconds: int = OFFICIAL_MAX_AGE_SECONDS,
         oauth_min_interval_seconds: int = DEFAULT_OAUTH_MIN_INTERVAL_SECONDS,
+        oauth_active_interval_seconds: int = DEFAULT_OAUTH_ACTIVE_INTERVAL_SECONDS,
+        activity_probe: Any | None = None,
+        remote_readings: Callable[[], list[Any]] | None = None,
     ) -> None:
         self.credentials_path = credentials_path
         self.timeout = timeout
         self.statusline_capture_path = statusline_capture_path
         self.usage_cache_path = usage_cache_path
+        # Supplied by RemoteClaudeRegistry.entries. A callable rather than the
+        # registry itself so the provider keeps no opinion about where pushes
+        # are stored, and tests can hand it a plain list.
+        self.remote_readings = remote_readings
         self.official_max_age_seconds = official_max_age_seconds
         self.oauth_min_interval_seconds = oauth_min_interval_seconds
+        self.oauth_active_interval_seconds = oauth_active_interval_seconds
+        # ClaudeActivityProbe; None disables adaptive pacing entirely.
+        self.activity_probe = activity_probe
         self.min_interval_seconds = LOCAL_MIN_INTERVAL_SECONDS
         self.retry_after_seconds: int | None = None
         self._oauth_next_attempt_at: datetime | None = None
@@ -493,6 +520,76 @@ class ClaudeProvider:
                 f"(max {self.official_max_age_seconds}s)"
             )
         return windows, observed_at, None
+
+    def _oauth_interval(self) -> int:
+        """Seconds to wait before the next OAuth call.
+
+        Tight while Claude Code is writing transcripts on this machine, wide
+        otherwise. A rate-limit backoff is applied on top of this by the caller,
+        so speeding up here can never shorten a server-issued Retry-After.
+        """
+        if self.activity_probe is None:
+            return self.oauth_min_interval_seconds
+        try:
+            active = self.activity_probe.is_active()
+        except Exception as exc:  # the probe must never break a fetch
+            logger.warning("Claude activity probe failed: %s", exc)
+            return self.oauth_min_interval_seconds
+        if not active:
+            return self.oauth_min_interval_seconds
+        # Never let the "fast" path end up slower than the idle one, however the
+        # two settings are configured.
+        return min(self.oauth_active_interval_seconds, self.oauth_min_interval_seconds)
+
+    def _read_remote_sources(
+        self, *, now: datetime
+    ) -> list[tuple[str, datetime | None, list[UsageWindow], str | None]]:
+        """Parse pushed readings with the local parsers, applying the same age
+        gate. A single malformed push must not take the Claude card down, so a
+        parser raising here is reported as a reason and skipped."""
+        if self.remote_readings is None:
+            return []
+        try:
+            readings = list(self.remote_readings())
+        except Exception as exc:  # registry unavailable — local files still work
+            logger.warning("remote Claude readings unavailable: %s", exc)
+            return []
+
+        parsers = {
+            "statusline": (parse_statusline_capture, STATUSLINE_SOURCE),
+            "usage_cache": (parse_usage_cache, USAGE_CACHE_SOURCE),
+        }
+        results: list[tuple[str, datetime | None, list[UsageWindow], str | None]] = []
+        for reading in readings:
+            entry = parsers.get(getattr(reading, "kind", ""))
+            if entry is None:
+                continue
+            parser, _local_name = entry
+            name = f"remote:{reading.source_name}"
+            try:
+                observed_at, windows, reason = parser(reading.payload)
+            except Exception as exc:
+                results.append((name, None, [], f"{name} unparseable: {exc}"))
+                continue
+            if reason is not None:
+                results.append((name, observed_at, windows, f"{name}: {reason}"))
+                continue
+            if observed_at is None:
+                results.append((name, None, [], f"{name} has no observation time"))
+                continue
+            age = (now - observed_at).total_seconds()
+            if age > self.official_max_age_seconds:
+                results.append(
+                    (
+                        name,
+                        observed_at,
+                        [],
+                        f"{name} is {int(age)}s old (max {self.official_max_age_seconds}s)",
+                    )
+                )
+                continue
+            results.append((name, observed_at, windows, None))
+        return results
 
     async def fetch(self) -> AccountSnapshot:
         hint: str | None = None
@@ -540,6 +637,18 @@ class ClaudeProvider:
             parsed_sources.append((source_name, observed_at, windows, reason))
             if reason is None and observed_at is not None and windows:
                 local_sources.append((source_name, observed_at, windows))
+
+        # Readings pushed by other machines go through the same two parsers and
+        # the same age gate; they are simply additional entries for the merge.
+        # Account-wide quota means the freshest reading wins no matter which
+        # host observed it.
+        for remote_name, remote_observed_at, remote_windows, remote_reason in (
+            self._read_remote_sources(now=now)
+        ):
+            if remote_reason is not None:
+                local_reasons.append(remote_reason)
+            elif remote_observed_at is not None and remote_windows:
+                local_sources.append((remote_name, remote_observed_at, remote_windows))
 
         for source_name, _observed_at, source_windows, reason in parsed_sources:
             if reason is not None:
@@ -617,9 +726,7 @@ class ClaudeProvider:
                 source=OAUTH_SOURCE,
             )
 
-        self._oauth_next_attempt_at = now + timedelta(
-            seconds=self.oauth_min_interval_seconds
-        )
+        self._oauth_next_attempt_at = now + timedelta(seconds=self._oauth_interval())
 
         headers = {**USAGE_HEADERS, "Authorization": f"Bearer {access_token}"}
         try:

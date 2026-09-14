@@ -165,7 +165,51 @@ curl -sS http://127.0.0.1:50048/api/usage | jq '.snapshots[] | select(.provider=
 # "statusline"                     → statusline capture only
 # "claude-code-cache"              → Claude Code's usage cache only
 # "statusline+claude-code-cache"   → both contributed, newer wins per window
+# "remote:oracle-edge/statusline"  → a pushed reading from another machine won
 # "oauth/usage"                    → fell back; .message says why
+```
+
+### Readings pushed from other machines
+
+Both local sources only update while a TUI renders on **this** host. Claude's
+quota, however, is per account: work done on another machine spends the same
+pool and leaves this host's files stale *and optimistic*. For the dashboard that
+is a cosmetic lag; for `/api/routing` it is a live wrong answer, because a model
+gets picked precisely when its remaining % looks healthy.
+
+So every machine that runs Claude Code pushes the two files it already has:
+
+```bash
+# on the other machine (tailnet)
+LIMIT_USAGE_URL=http://100.64.128.70:50048 python3 deploy/claude-usage-push.py
+
+# through the Cloudflare tunnel, for a host that cannot join the tailnet
+export CF_ACCESS_CLIENT_ID=... CF_ACCESS_CLIENT_SECRET=...
+LIMIT_USAGE_URL=https://usage.piea.uk python3 deploy/claude-usage-push.py
+
+# see what would be sent, contacting nothing
+python3 deploy/claude-usage-push.py --dry-run
+```
+
+`deploy/claude-usage-push.py` is stdlib-only and single-file so it can be copied
+to a host where you cannot install packages. Install it with
+`deploy/limit-usage-claude-push.{service,timer}` (every 2 min); on Windows, run
+the same script from Task Scheduler.
+
+The wire format is the files themselves, so the server reuses the same two
+parsers and there is no second schema to drift. Merging is by the **observation
+time inside the payload** (`captured_at_epoch` / `fetchedAtMs`), never arrival
+time — a push delayed by a slow timer or a flaky tunnel cannot overwrite a newer
+reading, and a pushed reading is held to the same
+`CLAUDE_OFFICIAL_MAX_AGE_SECONDS` gate as a local one.
+
+State is in-memory: a restart falls back to local files, and each host's next
+push restores it. That is why the agent pushes every run instead of only on
+change.
+
+```bash
+curl -sS http://127.0.0.1:50048/api/ingest/claude            # who has pushed, when
+curl -sS -X DELETE 'http://127.0.0.1:50048/api/ingest/claude?host=old-box'
 ```
 
 ## API
@@ -180,6 +224,9 @@ curl -sS http://127.0.0.1:50048/api/usage | jq '.snapshots[] | select(.provider=
 - `GET /api/trends?days=7` — 7-day series + burn-rate work estimates
 - `GET /api/system/health` — companion endpoint for Homepage system health and backup freshness
 - `GET /api/routing` — quota-aware model routing for dispatchers (see below)
+- `POST /api/ingest/claude` — another machine's Claude usage files (see above)
+- `GET /api/ingest/claude` — which hosts have pushed, and when
+- `DELETE /api/ingest/claude?host=` — drop pushed readings (one host, or all)
 
 ### Model routing for Trellis / `dispatch`
 

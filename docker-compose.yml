@@ -9,6 +9,15 @@ services:
     container_name: limit-usage
     ports:
       - "127.0.0.1:50048:50048"
+      # Tailnet address of this host (pipc). Other hosts on the tailnet —
+      # oracle-edge, the Windows box — reach /api/routing here, so dispatch on
+      # every machine shares one FeedbackRegistry and one usage.db. Bound to the
+      # tailnet IP rather than 0.0.0.0 because published Docker ports bypass ufw:
+      # 0.0.0.0 would put the unauthenticated write endpoints on every interface.
+      # Note: docker.service is not ordered after tailscaled.service, so on a cold
+      # boot this bind can lose the race and fail with "cannot assign requested
+      # address"; restart: unless-stopped retries until tailscale0 has the IP.
+      - "100.64.128.70:50048:50048"
     environment:
       HOST: "0.0.0.0"
       PORT: "50048"
@@ -21,6 +30,10 @@ services:
       CLAUDE_CREDENTIALS_PATH: "/secrets/claude/.credentials.json"
       CLAUDE_STATUSLINE_CAPTURE_PATH: "/secrets/claude-monitor/statusline/latest.json"
       CLAUDE_USAGE_CACHE_PATH: "/secrets/claude-monitor/state/claude-code-usage.json"
+      # Already inside the ~/.claude mount below. Only the newest mtime is read
+      # (never the contents) to decide whether anyone is spending quota right
+      # now, which paces the OAuth fallback.
+      CLAUDE_PROJECTS_DIR: "/secrets/claude/projects"
     volumes:
       - ./data:/app/data
       # Codex is read-only; Grok is writable so rotated OIDC tokens persist.
