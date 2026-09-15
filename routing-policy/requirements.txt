@@ -1,2 +1,8 @@
 PyYAML
 pydantic
+fastapi
+uvicorn
+pydantic-settings
+httpx
+pytest
+pytest-asyncio

@@ -80,3 +80,26 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  routing-policy:
+    build: ./routing-policy
+    image: routing-policy:local
+    container_name: routing-policy
+    ports:
+      # 只有 localhost。對外由 cloudflared 主動建立 outbound tunnel 接進來，
+      # origin 不需要 public IP，也不對 Internet 開 inbound port。
+      # 絕不加 tailnet IP 或 0.0.0.0：published docker port 會繞過 ufw。
+      - "127.0.0.1:50100:50100"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "50100"
+      LIMIT_USAGE_ROUTING_URL: "http://limit-usage:50048/api/routing"
+    depends_on:
+      - limit-usage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:50100/v1/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
