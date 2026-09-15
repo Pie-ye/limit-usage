@@ -43,35 +43,14 @@ def create_valid_upstream_payload() -> dict:
                 "pace_penalty": False,
                 "cooldown": {"cooling": False, "unavailable_until": None, "seconds_left": 0},
                 "message": "All good"
-            },
-            "grok": {
-                "provider": "grok",
-                "display_name": "Grok Pool",
-                "usable": False,
-                "stale": True,
-                "windows": {
-                    "1h": {"seconds_until_reset": 100}
-                },
-                "binding_slot": None,
-                "score": None,
-                "level": "exhausted",
-                "cooldown": {"cooling": True}
-            },
-            "broken": {
-                "usable": True,
-                "score": "not_a_float",
-                "level": "ok",
-                "stale": False,
-                "binding_slot": None,
-                "cooldown": {"cooling": False}
             }
         }
     }
 
 
 @pytest.mark.asyncio
-async def test_projection_and_fields() -> None:
-    """Test cases a, b, h, i: Normal projection, binding_slot null, broken pool skipped, no extra fields."""
+async def test_normal_projection() -> None:
+    """Test case a: Normal projection with all fields and seconds_until_reset correctly set."""
     handler = MockHandler()
     handler.response = httpx.Response(200, json=create_valid_upstream_payload())
     transport = httpx.MockTransport(handler)
@@ -87,26 +66,46 @@ async def test_projection_and_fields() -> None:
     assert not result.degraded
     assert result.fetched_at == now
     assert "claude" in result.signals
-    assert "grok" in result.signals
-    assert "broken" not in result.signals  # h. skipped
 
     c = result.signals["claude"]
-    # a. normal projection
     assert c["usable"] is True
     assert c["score"] == 96.0
     assert c["level"] == "ok"
     assert c["cooling"] is False
     assert c["seconds_until_reset"] == 10000
     assert c["stale"] is False
-    
-    # i. no extra fields
-    assert "provider" not in c
-    assert "display_name" not in c
-    assert "windows" not in c
-    assert "message" not in c
+
+
+@pytest.mark.asyncio
+async def test_binding_slot_null() -> None:
+    """Test case b: binding_slot is null."""
+    payload = {
+        "pools": {
+            "grok": {
+                "provider": "grok",
+                "display_name": "Grok Pool",
+                "usable": False,
+                "stale": True,
+                "windows": {
+                    "1h": {"seconds_until_reset": 100}
+                },
+                "binding_slot": None,
+                "score": None,
+                "level": "exhausted",
+                "cooldown": {"cooling": True}
+            }
+        }
+    }
+    handler = MockHandler()
+    handler.response = httpx.Response(200, json=payload)
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+
+    source = SignalSource(client=client)
+    with patch("app.signals.time.monotonic", return_value=100.0):
+        result = await source.get()
 
     g = result.signals["grok"]
-    # b. binding_slot is null
     assert g["seconds_until_reset"] is None
     assert g["usable"] is False
     assert g["score"] is None
@@ -210,3 +209,93 @@ async def test_missing_pools_key() -> None:
     assert res.stale is True
     assert res.degraded is True
     assert res.signals == {}
+
+
+@pytest.mark.asyncio
+async def test_broken_pool_skipped() -> None:
+    """Test case h: Single pool invalid format -> skip it, but others project correctly."""
+    payload = {
+        "pools": {
+            "claude": {
+                "usable": True,
+                "stale": False,
+                "binding_slot": None,
+                "score": 96.0,
+                "level": "ok",
+                "cooldown": {"cooling": False}
+            },
+            "broken": {
+                "usable": True,
+                "score": "not_a_float",
+                "level": "ok",
+                "stale": False,
+                "binding_slot": None,
+                "cooldown": {"cooling": False}
+            }
+        }
+    }
+    handler = MockHandler()
+    handler.response = httpx.Response(200, json=payload)
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+
+    source = SignalSource(client=client)
+    with patch("app.signals.time.monotonic", return_value=100.0):
+        result = await source.get()
+
+    assert "claude" in result.signals
+    assert "broken" not in result.signals
+
+
+@pytest.mark.asyncio
+async def test_no_extra_fields() -> None:
+    """Test case i: Expose exactly the 6 required keys, omit provider, message, etc."""
+    handler = MockHandler()
+    handler.response = httpx.Response(200, json=create_valid_upstream_payload())
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+
+    source = SignalSource(client=client)
+    with patch("app.signals.time.monotonic", return_value=100.0):
+        result = await source.get()
+
+    c = result.signals["claude"]
+    # assert exactly 6 keys
+    expected_keys = {"usable", "score", "level", "cooling", "seconds_until_reset", "stale"}
+    assert set(c.keys()) == expected_keys
+    
+    # assert explicit omission of these keys
+    assert "provider" not in c
+    assert "display_name" not in c
+    assert "windows" not in c
+    assert "message" not in c
+    assert "data_age_seconds" not in c
+    assert "cooldown" not in c
+
+
+@pytest.mark.asyncio
+async def test_continuous_failure_maintains_degraded_status() -> None:
+    """Regression test for finding 1: Continuous failure with no success always keeps degraded=True."""
+    handler = MockHandler()
+    handler.exception = httpx.TimeoutException("Timeout")
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+
+    source = SignalSource(ttl_seconds=30.0, client=client)
+
+    # First fetch fails
+    with patch("app.signals.time.monotonic", return_value=100.0):
+        res1 = await source.get()
+        
+    assert handler.call_count == 1
+    assert res1.degraded is True
+    assert res1.stale is True
+
+    # Second fetch outside TTL fails again
+    with patch("app.signals.time.monotonic", return_value=150.0):
+        res2 = await source.get()
+        
+    assert handler.call_count == 2
+    # Important: it should still be degraded
+    assert res2.degraded is True
+    assert res2.stale is True

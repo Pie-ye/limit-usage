@@ -47,6 +47,7 @@ class SignalSource:
 
         self._lock = asyncio.Lock()
         self._last_result: SignalResult | None = None
+        self._last_success: SignalResult | None = None
         self._last_fetch_time: float = 0.0
 
     async def get(self, *, now: datetime | None = None) -> SignalResult:
@@ -120,6 +121,7 @@ class SignalSource:
                     degraded=False,
                     fetched_at=actual_now,
                 )
+                self._last_success = result
                 self._last_result = result
                 self._last_fetch_time = current_time
                 return result
@@ -130,12 +132,12 @@ class SignalSource:
                 logger.warning("Signal fetch failed: host=%s status=%s elapsed=%.1fms", parsed_url.hostname, error_name, elapsed_ms)
 
                 # Fallback to last known good state minimizes routing disruption during brief upstream outages.
-                if self._last_result is not None:
+                if self._last_success is not None:
                     result = SignalResult(
-                        signals=self._last_result.signals,
+                        signals=self._last_success.signals,
                         stale=True,
                         degraded=False,
-                        fetched_at=self._last_result.fetched_at,
+                        fetched_at=self._last_success.fetched_at,
                     )
                 else:
                     result = SignalResult(
