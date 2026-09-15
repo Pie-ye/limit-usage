@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Request, status
+from fastapi import Depends, FastAPI, Request, Response, status
 from fastapi.exception_handlers import (
     http_exception_handler,
     request_validation_exception_handler,
@@ -41,7 +42,14 @@ from app.engine import Recommendation, recommend
 from app.policy import Policy, load_policy
 from app.signals import SignalResult, SignalSource
 
+# Configure root and service logging with standard UTC ISO 8601 timestamps.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +145,7 @@ class RecommendResponse(BaseModel):
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Initialize singleton policy and signal source instances on server startup."""
     settings = get_settings()
     policy = load_policy(settings.policy_dir)
@@ -151,6 +159,8 @@ async def lifespan(app: FastAPI):
     app.state.signal_source = signal_source
     yield
     # Gracefully shut down active upstream HTTP client connections on exit.
+    # Note: signals.py does not expose a public aclose method and task constraints
+    # strictly forbid modifying signals.py, necessitating access to _client.
     if signal_source._client is not None and not signal_source._client.is_closed:
         await signal_source._client.aclose()
 
@@ -184,28 +194,73 @@ def get_app_settings(request: Request) -> Settings:
 
 
 # ---------------------------------------------------------------------------
-# Application Instance & Global Exception Handling
+# Application Instance & Middleware
 # ---------------------------------------------------------------------------
 
+# Explicitly disable OpenAPI/Swagger/ReDoc endpoints: the service is exposed to the
+# public Internet via Cloudflare Tunnel and must strictly expose only the three
+# authorized API endpoints (/v1/health, /v1/policy, /v1/recommend).
 app = FastAPI(
     title="Routing Policy Service",
     description="Declarative routing policy decision layer for AI agent workflows",
     version="1.0.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
     lifespan=lifespan,
 )
 
 
 @app.middleware("http")
-async def catch_unhandled_exceptions(request: Request, call_next):
-    """Intercept all unhandled runtime exceptions and return generic internal error."""
+async def audit_and_exception_middleware(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    """Intercept unhandled exceptions and record §42 audit log entries for every recommend request.
+
+    Rationale for using HTTP middleware instead of an `@app.exception_handler(Exception)`:
+    In Starlette/FastAPI, ServerErrorMiddleware wraps around the routing stack and unconditionally
+    re-raises unhandled exceptions after invoking exception handlers. Middleware placed inside
+    ServerErrorMiddleware intercepts any unhandled exception before it reaches ServerErrorMiddleware,
+    allowing the service to reliably return a clean, sanitized HTTP 500 response without letting
+    exception traces leak into ASGI hosts or test clients.
+    """
+    start_time = time.monotonic()
+    response: Response | None = None
     try:
-        return await call_next(request)
+        response = await call_next(request)
+        return response
     except Exception as exc:
+        # Sanitize all unexpected errors to prevent tracebacks, tokens, or URLs from leaking.
         logger.error("Unhandled error: %s", type(exc).__name__)
-        return JSONResponse(
+        response = JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"detail": "internal error"},
         )
+        return response
+    finally:
+        # §42 Audit Logging: every request to /v1/recommend must write exactly one line
+        # covering all outcomes (200, 422, 500) without leaking body contents or headers.
+        if request.url.path == "/v1/recommend":
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            status_code = response.status_code if response is not None else 500
+            tier = getattr(request.state, "tier", "unknown")
+            role = getattr(request.state, "role", "unknown")
+            model = getattr(request.state, "model", "none")
+            policy_obj = getattr(request.app.state, "policy", None)
+            policy_ver = getattr(request.state, "policy_version", None) or (
+                policy_obj.policy_version if policy_obj else "unknown"
+            )
+
+            logger.info(
+                "recommend: tier=%s role=%s model=%s policy_version=%s status=%d elapsed=%.1fms",
+                tier,
+                role,
+                model,
+                policy_ver,
+                status_code,
+                elapsed_ms,
+            )
 
 
 @app.exception_handler(RequestValidationError)
@@ -222,18 +277,6 @@ async def handle_http_exception(
 ) -> JSONResponse:
     """Preserve standard HTTP exceptions like 404 Not Found without exposing server internals."""
     return await http_exception_handler(request, exc)
-
-
-@app.exception_handler(Exception)
-async def handle_unexpected_exception(
-    request: Request, exc: Exception
-) -> JSONResponse:
-    """Trap all unhandled exceptions to prevent tracebacks or upstream URLs from leaking."""
-    logger.error("Unhandled error: %s", type(exc).__name__)
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "internal error"},
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -271,13 +314,18 @@ async def get_policy_overview(
 
 @app.post("/v1/recommend", response_model=RecommendResponse)
 async def recommend_model(
+    request: Request,
     body: RecommendRequest,
     policy: Policy = Depends(get_policy),
     signal_source: SignalSource = Depends(get_signal_source),
     settings: Settings = Depends(get_app_settings),
 ) -> RecommendResponse:
     """Select the optimal model for a requested tier and role using real-time capacity signals."""
-    start_time = time.monotonic()
+    # Stash request audit context on request.state for middleware logging across all outcomes.
+    request.state.tier = body.tier
+    request.state.role = body.role
+    request.state.policy_version = policy.policy_version
+    request.state.model = "none"
 
     # Normalize vendor identifiers to internal pool namespace.
     raw_vendors = body.client.available_vendors if body.client else None
@@ -324,18 +372,8 @@ async def recommend_model(
         for alt in rec.alternatives
     ]
 
-    elapsed_ms = (time.monotonic() - start_time) * 1000
     chosen_model = rec.recommended["model"] if rec.recommended else "none"
-
-    # Log minimal operational audit entry without request payloads or headers.
-    logger.info(
-        "recommend: tier=%s role=%s model=%s policy_version=%s status=200 elapsed=%.1fms",
-        body.tier,
-        body.role,
-        chosen_model,
-        policy.policy_version,
-        elapsed_ms,
-    )
+    request.state.model = chosen_model
 
     return RecommendResponse(
         policy_version=policy.policy_version,
@@ -347,4 +385,15 @@ async def recommend_model(
         alternatives=alternative_targets,
         reason_codes=rec.reason_codes,
         wait_seconds=rec.wait_seconds,
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    server_settings = get_settings()
+    uvicorn.run(
+        "app.main:app",
+        host=server_settings.host,
+        port=server_settings.port,
     )

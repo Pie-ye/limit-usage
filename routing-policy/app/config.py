@@ -52,6 +52,13 @@ def normalize_vendor_list(vendors: list[str] | None) -> list[str] | None:
 
     Returns None if the input is None, indicating that no vendor constraint was requested.
     Deduplicates resolved names while preserving first-seen ordering.
+
+    Design tradeoff note:
+    When a client provides vendors but all of them are unknown to this service (e.g.
+    `available_vendors: ["some-new-cli"]`), this returns `[]` rather than falling back
+    to `None`. Returning `[]` causes the engine to evaluate zero eligible candidates and
+    return `recommended: null` + `fallback_static`, signaling the client to honestly fall
+    back to its own static ladder rather than silently dispatching to an unavailable vendor.
     """
     if vendors is None:
         return None

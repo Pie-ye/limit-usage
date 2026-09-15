@@ -28,7 +28,7 @@ All unexpected exceptions result in a generic `500 Internal Server Error` with b
 
 ## 2. API Endpoints
 
-Base path prefix: `/v1`.
+Base path prefix: `/v1`. Only three endpoints exist. Automatic interactive documentation endpoints (`/docs`, `/redoc`, `/openapi.json`) are explicitly disabled to prevent schema enumeration over public tunnel ingress.
 
 ### `GET /v1/health`
 Public liveness and policy version check. Returns exactly two fields.

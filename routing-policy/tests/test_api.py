@@ -7,13 +7,15 @@ initiating external network calls or spinning up background containers.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Generator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import Settings
 from app.main import app
 from app.policy import load_policy
 from app.signals import SignalResult
@@ -85,11 +87,18 @@ class StubSignalSource:
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client() -> Generator[TestClient, None, None]:
     """Provide a TestClient with a healthy stub signal source."""
     with TestClient(app) as test_client:
         test_client.app.state.signal_source = StubSignalSource()
         yield test_client
+
+
+def test_documentation_endpoints_disabled(client: TestClient) -> None:
+    """Verify OpenAPI, Swagger UI, and ReDoc documentation endpoints are disabled (404)."""
+    assert client.get("/docs").status_code == 404
+    assert client.get("/redoc").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
 
 
 def test_health_endpoint_exact_keys(client: TestClient) -> None:
@@ -308,3 +317,62 @@ def test_unknown_vendor_in_available_vendors_ignored(
     data = response.json()
     assert data["recommended"] is not None
     assert data["recommended"]["vendor"] == "claude"
+
+
+def test_recommend_audit_log_format_and_content(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verify §42 audit logging: INFO line with tier, role, model, policy_version, status, elapsed ms."""
+    caplog.set_level(logging.INFO, logger="app.main")
+    payload = {
+        "tier": "T2",
+        "role": "implement",
+        "client": {"available_vendors": ["openai"]},
+        "min_score": 15.0,
+    }
+    response = client.post("/v1/recommend", json=payload)
+    assert response.status_code == 200
+
+    recommend_logs = [
+        record
+        for record in caplog.records
+        if record.name == "app.main" and "recommend:" in record.message
+    ]
+    assert len(recommend_logs) == 1
+    log_msg = recommend_logs[0].message
+    assert "tier=T2" in log_msg
+    assert "role=implement" in log_msg
+    assert "policy_version=2026-09-15.1" in log_msg
+    assert "status=200" in log_msg
+    assert "elapsed=" in log_msg
+
+    # Must NOT log other request body contents or headers
+    assert "available_vendors" not in log_msg
+    assert "min_score" not in log_msg
+    assert "openai" not in log_msg
+
+
+def test_recommend_audit_log_on_422_validation_failure(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verify audit log is also recorded across failure outcomes (422)."""
+    caplog.set_level(logging.INFO, logger="app.main")
+    response = client.post("/v1/recommend", json={"tier": "T9", "role": "implement"})
+    assert response.status_code == 422
+
+    recommend_logs = [
+        record
+        for record in caplog.records
+        if record.name == "app.main" and "recommend:" in record.message
+    ]
+    assert len(recommend_logs) == 1
+    assert "status=422" in recommend_logs[0].message
+
+
+def test_settings_security_default_localhost(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify safe localhost binding default (127.0.0.1:50100) when no environment override exists."""
+    monkeypatch.delenv("HOST", raising=False)
+    monkeypatch.delenv("PORT", raising=False)
+    s = Settings(_env_file=None)
+    assert s.host == "127.0.0.1"
+    assert s.port == 50100

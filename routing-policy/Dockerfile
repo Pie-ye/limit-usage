@@ -20,4 +20,4 @@ USER appuser
 
 EXPOSE 50100
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "50100"]
+CMD ["python", "-m", "app.main"]
