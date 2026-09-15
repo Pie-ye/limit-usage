@@ -84,8 +84,10 @@ def _compute_wait_seconds(
 ) -> int | None:
     """Compute recovery wait duration for a non-eligible pool.
 
-    Cooldown remaining time is absent from sanitized signals, so reset time acts as
-    the conservative return estimate when cooling or degraded.
+    This differs from legacy _wait_seconds (which returns cooldown remaining seconds)
+    and is intentional: sanitized signals omit cooldown details for minimal surface
+    exposure, so the window reset time acts as a conservative return estimate when
+    cooling or degraded.
     """
     if signal is None:
         return None
@@ -109,6 +111,7 @@ def recommend(
     available_vendors: list[str] | None = None,
     min_score: float | None = None,
     now: datetime | None = None,
+    signals_stale: bool = False,
 ) -> Recommendation:
     """Select the best candidate model according to quota signals and policy.
 
@@ -117,6 +120,11 @@ def recommend(
     ascending cost rank. Unlike legacy routing_view which falls back to ranked[0],
     this function sets recommended to None when no candidate is eligible to enable
     clean client-side static fallbacks.
+
+    Note: The candidate ranking order is hardcoded in v1 to guarantee strict
+    behavioral parity with routing_view's sorting logic. The ranking attribute in
+    roles.yaml is descriptive documentation of this intent; changing the ranking
+    sequence requires updating engine.py.
     """
     # 1. Candidate population based on requested role.
     if role == "review":
@@ -255,7 +263,7 @@ def recommend(
     if available_vendors is not None:
         reason_codes.append("vendor_filtered")
 
-    if top_info is not None and top_info["stale"]:
+    if top_info is not None and (top_info["stale"] or signals_stale):
         reason_codes.append("stale_signals")
 
     if top_model is None:

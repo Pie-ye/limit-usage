@@ -365,6 +365,7 @@ async def recommend_model(
         available_vendors=normalized_available_vendors,
         min_score=body.min_score,
         now=now_utc,
+        signals_stale=signal_result.stale,
     )
 
     # Format ISO 8601 UTC timestamps with explicit Z suffix.

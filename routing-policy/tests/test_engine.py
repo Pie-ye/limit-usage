@@ -493,6 +493,15 @@ def test_stale_signals_reason_code(policy: Policy) -> None:
     assert "stale_signals" in rec.reason_codes
 
 
+def test_signals_stale_flag_adds_stale_signals_reason_code(policy: Policy) -> None:
+    """signals_stale parameter causes stale_signals reason code to be included."""
+    signals = _default_signals({"claude": {"score": 99.0, "stale": False}})
+    rec = recommend(policy, signals, tier="T3", role="implement", signals_stale=True)
+    assert rec.recommended is not None
+    assert rec.recommended["model"] == "claude-opus-5"
+    assert "stale_signals" in rec.reason_codes
+
+
 def test_reason_codes_strict_order(policy: Policy) -> None:
     """Reason codes must follow the fixed specification order without duplicates."""
     signals = _default_signals({"claude": {"score": 99.0, "stale": True}})

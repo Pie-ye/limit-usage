@@ -131,10 +131,17 @@ Configured via environment variables using `pydantic-settings`:
 `routing-policy` operates as a downstream consumer of `limit-usage`'s `GET /api/routing` endpoint.
 - **Current State**: Both services coexist. `limit-usage` maintains quota tracking and database polling while `routing-policy` consumes real-time pool health projections to make decoupled routing decisions.
 - **Future Direction**: The capacity signal layer will be migrated to OmniRoute once deployed, at which point `LIMIT_USAGE_ROUTING_URL` will be updated to point to the new signal provider without breaking the routing policy interface.
+- **Candidate Ranking in v1**: The `ranking` field in `policy/roles.yaml` (`[availability, quota, capability, cost]`) is descriptive in v1, documenting the intent of candidate evaluation order. The sorting key is hardcoded in `engine.py` to maintain strict behavioral parity with `limit-usage`'s `routing_view`; changing the ranking sequence requires modifying `engine.py`.
 
 ---
 
 ## 5. Local Verification
+
+Install development dependencies:
+```bash
+cd routing-policy
+/home/pieye/Container/limit-usage/.venv/bin/pip install -r requirements-dev.txt
+```
 
 Start the development server from the service directory:
 ```bash

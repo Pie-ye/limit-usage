@@ -58,7 +58,16 @@ class Policy(_PolicyModel):
     models: dict[str, Model]
     tiers: dict[str, Tier]
     review_cross_vendor: bool
-    ranking: list[str]
+    # Descriptive documentation of candidate ranking intent (availability -> quota -> capability -> cost) in v1.
+    # Sorting order is hardcoded in engine.py for behavioral parity with routing_view;
+    # modifying this list does not alter candidate selection without engine.py changes.
+    ranking: list[str] = Field(
+        description=(
+            "Descriptive documentation of candidate ranking intent in v1. "
+            "Engine candidate sorting is hardcoded to guarantee behavioral parity "
+            "with legacy routing_view; changing the evaluation sequence requires modifying engine.py."
+        )
+    )
     orchestrator_excluded_vendors: list[str]
 
     def tier_candidates(self, tier_id: str) -> list[str]:

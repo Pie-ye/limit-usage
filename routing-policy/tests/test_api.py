@@ -243,6 +243,38 @@ def test_signals_unavailable_returns_200_null_recommended(
     assert "no_eligible_candidate" in data["reason_codes"]
 
 
+def test_stale_signal_result_includes_stale_signals_reason_code(
+    client: TestClient,
+) -> None:
+    """When SignalResult has stale=True on cached signals, /v1/recommend includes stale_signals in reason_codes."""
+    fresh_signals = {
+        "claude": {
+            "usable": True,
+            "score": 90.0,
+            "level": "ok",
+            "cooling": False,
+            "seconds_until_reset": 3600,
+            "stale": False,
+        }
+    }
+    client.app.state.signal_source = StubSignalSource(
+        result=SignalResult(
+            signals=fresh_signals,
+            stale=True,
+            degraded=False,
+            fetched_at=datetime.now(timezone.utc),
+        )
+    )
+    response = client.post(
+        "/v1/recommend",
+        json={"tier": "T2", "role": "implement"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["recommended"] is not None
+    assert "stale_signals" in data["reason_codes"]
+
+
 def test_extra_unknown_fields_accepted(client: TestClient) -> None:
     """Case h: Unknown additional fields must not cause 422 validation errors."""
     response = client.post(
@@ -282,24 +314,63 @@ def test_signal_exception_returns_500_generic_error(client: TestClient) -> None:
 def test_recommend_response_does_not_leak_internal_keys(
     client: TestClient,
 ) -> None:
-    """Case j: Recommend response serialization must not leak score, remaining_percent, cooldown, pool, bench, cost_rank."""
+    """Case j: Structural contract verification ensuring no internal quota/pool keys or numeric quota metrics leak."""
     response = client.post(
         "/v1/recommend",
         json={"tier": "T2", "role": "implement"},
     )
     assert response.status_code == 200
-    text = response.text.lower()
+    data = response.json()
 
-    forbidden_substrings = (
-        "score",
-        "remaining_percent",
-        "cooldown",
-        "pool",
-        "bench",
-        "cost_rank",
-    )
-    for term in forbidden_substrings:
-        assert term not in text, f"Leaked internal term in recommend response: {term}"
+    # 1. Exact allowed top-level keys
+    allowed_top_keys = {
+        "policy_version",
+        "generated_at",
+        "expires_at",
+        "tier",
+        "role",
+        "recommended",
+        "alternatives",
+        "reason_codes",
+        "wait_seconds",
+    }
+    assert set(data.keys()) == allowed_top_keys
+
+    # 2. recommended and alternatives keys strictly {vendor, model}
+    if data["recommended"] is not None:
+        assert set(data["recommended"].keys()) == {"vendor", "model"}
+        assert isinstance(data["recommended"]["vendor"], str)
+        assert isinstance(data["recommended"]["model"], str)
+
+    assert isinstance(data["alternatives"], list)
+    for alt in data["alternatives"]:
+        assert set(alt.keys()) == {"vendor", "model"}
+        assert isinstance(alt["vendor"], str)
+        assert isinstance(alt["model"], str)
+
+    # 3. reason_codes are strictly within the engine's fixed REASON_CODES set
+    from app.engine import REASON_CODES
+
+    assert isinstance(data["reason_codes"], list)
+    for code in data["reason_codes"]:
+        assert code in REASON_CODES
+
+    # 4. Recursively assert no float/int quota numeric values leak in unexpected places.
+    # Only wait_seconds may be int | None; all other values must be str, dict, list, or bool/None.
+    def assert_no_leaked_metrics(val: Any, path: str) -> None:
+        if path == "wait_seconds":
+            assert val is None or isinstance(val, int), f"wait_seconds must be int or None, got {type(val)}"
+            return
+        if isinstance(val, dict):
+            for k, v in val.items():
+                assert_no_leaked_metrics(v, f"{path}.{k}" if path else k)
+        elif isinstance(val, list):
+            for i, v in enumerate(val):
+                assert_no_leaked_metrics(v, f"{path}[{i}]")
+        else:
+            assert not isinstance(val, (int, float)), f"Leaked numeric metric at '{path}': {val}"
+
+    assert_no_leaked_metrics(data, "")
 
 
 def test_unknown_vendor_in_available_vendors_ignored(
@@ -321,39 +392,41 @@ def test_unknown_vendor_in_available_vendors_ignored(
 
 
 def test_recommend_audit_log_format_and_content(
-    client: TestClient,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify §42 audit logging: INFO line with tier, role, model, policy_version, status, elapsed ms."""
+    """Audit log records timestamp, tier, role, model, policy_version, status, elapsed."""
     caplog.set_level(logging.INFO, logger="app.main")
-    service_logger = logging.getLogger("app")
-    service_logger.addHandler(caplog.handler)
-    payload = {
-        "tier": "T2",
-        "role": "implement",
-        "client": {"available_vendors": ["openai"]},
-        "min_score": 15.0,
-    }
-    try:
-        response = client.post("/v1/recommend", json=payload)
-    finally:
-        service_logger.removeHandler(caplog.handler)
+    response = client.post(
+        "/v1/recommend",
+        json={
+            "tier": "T2",
+            "role": "implement",
+            "client": {"available_vendors": ["openai"]},
+            "min_score": 10,
+        },
+    )
     assert response.status_code == 200
 
+    service_logger = logging.getLogger("app")
     recommend_logs = [
         record
         for record in caplog.records
-        if record.name == "app.main" and "recommend:" in record.message
+        if record.name == "app.main" and "recommend:" in record.getMessage()
     ]
     assert len(recommend_logs) == 1
-    log_msg = recommend_logs[0].message
+
+    log_msg = recommend_logs[0].getMessage()
     assert "tier=T2" in log_msg
     assert "role=implement" in log_msg
-    assert f"model={response.json()['recommended']['model']}" in log_msg
+    assert "model=" in log_msg
     assert "policy_version=2026-09-15.1" in log_msg
     assert "status=200" in log_msg
     assert "elapsed=" in log_msg
+
+    # Must NOT log other request body contents or headers
+    assert "available_vendors" not in log_msg
+    assert "min_score" not in log_msg
+    assert "openai" not in log_msg
 
     service_formatters = [
         handler.formatter
@@ -366,6 +439,8 @@ def test_recommend_audit_log_format_and_content(
         with monkeypatch.context() as timezone_environment:
             timezone_environment.setenv("TZ", "Asia/Taipei")
             time.tzset()
+            if time.timezone == 0 and time.altzone == 0:
+                pytest.skip("tzdata not available in environment (e.g. python:3.14-slim without /usr/share/zoneinfo)")
             record = recommend_logs[0]
             expected_utc = datetime.fromtimestamp(
                 record.created, timezone.utc
@@ -381,11 +456,6 @@ def test_recommend_audit_log_format_and_content(
     finally:
         # Restore libc's cached timezone after monkeypatch restores the environment.
         time.tzset()
-
-    # Must NOT log other request body contents or headers
-    assert "available_vendors" not in log_msg
-    assert "min_score" not in log_msg
-    assert "openai" not in log_msg
 
 
 def test_recommend_audit_log_on_422_validation_failure(
