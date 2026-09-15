@@ -42,14 +42,28 @@ from app.engine import Recommendation, recommend
 from app.policy import Policy, load_policy
 from app.signals import SignalResult, SignalSource
 
-# Configure root and service logging with standard UTC ISO 8601 timestamps.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
-)
+# Configure only this service's logger hierarchy so dependency INFO logs cannot
+# disclose request destinations. The named handler guard also prevents duplicate
+# lines when ``python -m app.main`` causes uvicorn to import this module by name.
+logging.Formatter.converter = time.gmtime
+_SERVICE_LOGGER = logging.getLogger("app")
+_SERVICE_LOGGER.setLevel(logging.INFO)
+_SERVICE_LOG_HANDLER_NAME = "routing-policy-stderr"
+if not any(
+    handler.get_name() == _SERVICE_LOG_HANDLER_NAME
+    for handler in _SERVICE_LOGGER.handlers
+):
+    _service_handler = logging.StreamHandler()
+    _service_handler.set_name(_SERVICE_LOG_HANDLER_NAME)
+    _service_handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%SZ",
+        )
+    )
+    _SERVICE_LOGGER.addHandler(_service_handler)
+_SERVICE_LOGGER.propagate = False
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------------

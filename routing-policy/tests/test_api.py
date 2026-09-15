@@ -8,6 +8,7 @@ initiating external network calls or spinning up background containers.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Generator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -320,17 +321,24 @@ def test_unknown_vendor_in_available_vendors_ignored(
 
 
 def test_recommend_audit_log_format_and_content(
-    client: TestClient, caplog: pytest.LogCaptureFixture
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify §42 audit logging: INFO line with tier, role, model, policy_version, status, elapsed ms."""
     caplog.set_level(logging.INFO, logger="app.main")
+    service_logger = logging.getLogger("app")
+    service_logger.addHandler(caplog.handler)
     payload = {
         "tier": "T2",
         "role": "implement",
         "client": {"available_vendors": ["openai"]},
         "min_score": 15.0,
     }
-    response = client.post("/v1/recommend", json=payload)
+    try:
+        response = client.post("/v1/recommend", json=payload)
+    finally:
+        service_logger.removeHandler(caplog.handler)
     assert response.status_code == 200
 
     recommend_logs = [
@@ -342,9 +350,37 @@ def test_recommend_audit_log_format_and_content(
     log_msg = recommend_logs[0].message
     assert "tier=T2" in log_msg
     assert "role=implement" in log_msg
+    assert f"model={response.json()['recommended']['model']}" in log_msg
     assert "policy_version=2026-09-15.1" in log_msg
     assert "status=200" in log_msg
     assert "elapsed=" in log_msg
+
+    service_formatters = [
+        handler.formatter
+        for handler in service_logger.handlers
+        if handler.formatter is not None
+        and handler.formatter.datefmt == "%Y-%m-%dT%H:%M:%SZ"
+    ]
+    assert len(service_formatters) == 1
+    try:
+        with monkeypatch.context() as timezone_environment:
+            timezone_environment.setenv("TZ", "Asia/Taipei")
+            time.tzset()
+            record = recommend_logs[0]
+            expected_utc = datetime.fromtimestamp(
+                record.created, timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%S")
+            local_time = datetime.fromtimestamp(record.created).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            )
+            assert local_time != expected_utc
+            rendered_log = service_formatters[0].format(record)
+            assert rendered_log.startswith(
+                f"{expected_utc}Z [INFO] app.main: recommend:"
+            )
+    finally:
+        # Restore libc's cached timezone after monkeypatch restores the environment.
+        time.tzset()
 
     # Must NOT log other request body contents or headers
     assert "available_vendors" not in log_msg
@@ -357,7 +393,14 @@ def test_recommend_audit_log_on_422_validation_failure(
 ) -> None:
     """Verify audit log is also recorded across failure outcomes (422)."""
     caplog.set_level(logging.INFO, logger="app.main")
-    response = client.post("/v1/recommend", json={"tier": "T9", "role": "implement"})
+    service_logger = logging.getLogger("app")
+    service_logger.addHandler(caplog.handler)
+    try:
+        response = client.post(
+            "/v1/recommend", json={"tier": "T9", "role": "implement"}
+        )
+    finally:
+        service_logger.removeHandler(caplog.handler)
     assert response.status_code == 422
 
     recommend_logs = [
@@ -367,6 +410,14 @@ def test_recommend_audit_log_on_422_validation_failure(
     ]
     assert len(recommend_logs) == 1
     assert "status=422" in recommend_logs[0].message
+
+
+def test_service_logging_does_not_enable_dependency_info() -> None:
+    """Service logs stay at INFO without enabling dependency request logging."""
+    assert logging.getLogger("app.main").isEnabledFor(logging.INFO)
+    assert logging.getLogger("app.signals").isEnabledFor(logging.INFO)
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
+    assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
 
 
 def test_settings_security_default_localhost(monkeypatch: pytest.MonkeyPatch) -> None:

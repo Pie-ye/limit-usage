@@ -136,6 +136,15 @@ Configured via environment variables using `pydantic-settings`:
 
 ## 5. Local Verification
 
+Start the development server from the service directory:
+```bash
+cd routing-policy
+/home/pieye/Container/limit-usage/.venv/bin/python -m app.main
+```
+
+The module entrypoint reads `HOST` and `PORT` from the environment and defaults to
+`127.0.0.1:50100` when they are not set.
+
 Run the test suite:
 ```bash
 cd routing-policy
