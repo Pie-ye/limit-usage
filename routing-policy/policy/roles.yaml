@@ -1,0 +1,8 @@
+schema_version: 1
+policy:
+  review:
+    cross_vendor: true
+ranking: [availability, quota, capability, cost]
+orchestrator:
+  # agy may only supply gemini-* subagents and must never orchestrate.
+  excluded_vendors: [agy]
