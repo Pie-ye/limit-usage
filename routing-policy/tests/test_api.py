@@ -1,0 +1,499 @@
+"""Integration and contract tests for the routing policy FastAPI service.
+
+Validates the complete HTTP boundary including parameter validation, response schema
+sanitization, vendor namespace normalization, and failure containment without
+initiating external network calls or spinning up background containers.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Generator
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.config import Settings
+from app.main import app
+from app.policy import load_policy
+from app.signals import SignalResult
+
+
+class StubSignalSource:
+    """Configurable in-memory signal source to isolate API tests from network I/O."""
+
+    def __init__(
+        self,
+        result: SignalResult | None = None,
+        raise_exc: Exception | None = None,
+    ) -> None:
+        self._result = result
+        self._raise_exc = raise_exc
+
+    async def get(self, *, now: datetime | None = None) -> SignalResult:
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        if self._result is not None:
+            return self._result
+        return SignalResult(
+            signals={
+                "claude": {
+                    "usable": True,
+                    "score": 85.0,
+                    "level": "ok",
+                    "cooling": False,
+                    "seconds_until_reset": 3600,
+                    "stale": False,
+                },
+                "codex": {
+                    "usable": True,
+                    "score": 90.0,
+                    "level": "ok",
+                    "cooling": False,
+                    "seconds_until_reset": 3600,
+                    "stale": False,
+                },
+                "grok": {
+                    "usable": True,
+                    "score": 75.0,
+                    "level": "ok",
+                    "cooling": False,
+                    "seconds_until_reset": 3600,
+                    "stale": False,
+                },
+                "agy": {
+                    "usable": True,
+                    "score": 80.0,
+                    "level": "ok",
+                    "cooling": False,
+                    "seconds_until_reset": 3600,
+                    "stale": False,
+                },
+                "agy-3p": {
+                    "usable": True,
+                    "score": 70.0,
+                    "level": "ok",
+                    "cooling": False,
+                    "seconds_until_reset": 3600,
+                    "stale": False,
+                },
+            },
+            stale=False,
+            degraded=False,
+            fetched_at=datetime.now(timezone.utc),
+        )
+
+
+@pytest.fixture
+def client() -> Generator[TestClient, None, None]:
+    """Provide a TestClient with a healthy stub signal source."""
+    with TestClient(app) as test_client:
+        test_client.app.state.signal_source = StubSignalSource()
+        yield test_client
+
+
+def test_documentation_endpoints_disabled(client: TestClient) -> None:
+    """Verify OpenAPI, Swagger UI, and ReDoc documentation endpoints are disabled (404)."""
+    assert client.get("/docs").status_code == 404
+    assert client.get("/redoc").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
+
+
+def test_health_endpoint_exact_keys(client: TestClient) -> None:
+    """Case a: GET /v1/health must return exactly two keys (status and policy_version)."""
+    response = client.get("/v1/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert set(data.keys()) == {"status", "policy_version"}
+    assert len(data) == 2
+    assert data["status"] == "ok"
+    assert isinstance(data["policy_version"], str)
+
+
+def test_policy_endpoint_no_internal_model_or_scoring_keys(
+    client: TestClient,
+) -> None:
+    """Case b: GET /v1/policy must not leak model IDs, bench, cost_rank, pool, or provider keys."""
+    response = client.get("/v1/policy")
+    assert response.status_code == 200
+    text = response.text
+
+    policy_dir = Path(__file__).parent.parent / "policy"
+    policy = load_policy(policy_dir)
+
+    for model_id in policy.models.keys():
+        assert model_id not in text, f"Found leaked model id: {model_id}"
+
+    forbidden_keys = ("bench", "cost_rank", "pool", "provider")
+    for key in forbidden_keys:
+        assert key not in text, f"Found leaked policy attribute: {key}"
+
+    data = response.json()
+    assert data["schema_version"] == 1
+    assert "T0" in data["tiers"]
+    assert "review" in data
+    assert data["review"]["cross_vendor"] is True
+
+
+def test_recommend_normal_path_ttl_difference(client: TestClient) -> None:
+    """Case c: POST /v1/recommend returns complete fields and expires_at - generated_at == 300s."""
+    payload = {"tier": "T2", "role": "implement"}
+    response = client.post("/v1/recommend", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+
+    expected_keys = {
+        "policy_version",
+        "generated_at",
+        "expires_at",
+        "tier",
+        "role",
+        "recommended",
+        "alternatives",
+        "reason_codes",
+        "wait_seconds",
+    }
+    assert set(data.keys()) == expected_keys
+
+    gen_dt = datetime.fromisoformat(data["generated_at"].replace("Z", "+00:00"))
+    exp_dt = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))
+    assert (exp_dt - gen_dt).total_seconds() == 300
+
+
+def test_recommend_invalid_tier_or_role_422(client: TestClient) -> None:
+    """Case d: tier: 'T9' -> 422; role: 'deploy' -> 422."""
+    resp_tier = client.post(
+        "/v1/recommend",
+        json={"tier": "T9", "role": "implement"},
+    )
+    assert resp_tier.status_code == 422
+
+    resp_role = client.post(
+        "/v1/recommend",
+        json={"tier": "T2", "role": "deploy"},
+    )
+    assert resp_role.status_code == 422
+
+
+def test_vendor_alias_mapping_anthropic_and_claude(client: TestClient) -> None:
+    """Case e: available_vendors ['anthropic'] and ['claude'] yield identical recommendations."""
+    resp_anthropic = client.post(
+        "/v1/recommend",
+        json={
+            "tier": "T2",
+            "role": "implement",
+            "client": {"available_vendors": ["anthropic"]},
+        },
+    )
+    resp_claude = client.post(
+        "/v1/recommend",
+        json={
+            "tier": "T2",
+            "role": "implement",
+            "client": {"available_vendors": ["claude"]},
+        },
+    )
+
+    assert resp_anthropic.status_code == 200
+    assert resp_claude.status_code == 200
+
+    data_a = resp_anthropic.json()
+    data_c = resp_claude.json()
+
+    assert data_a["recommended"] == data_c["recommended"]
+    assert data_a["alternatives"] == data_c["alternatives"]
+    assert data_a["recommended"]["vendor"] == "claude"
+
+
+def test_cross_vendor_review_different_vendor(client: TestClient) -> None:
+    """Case f: role='review' with implemented_by_vendor='codex' never recommends codex."""
+    response = client.post(
+        "/v1/recommend",
+        json={
+            "tier": "T3",
+            "role": "review",
+            "implemented_by_vendor": "codex",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["recommended"] is not None
+    assert data["recommended"]["vendor"] != "codex"
+    assert "cross_vendor_review" in data["reason_codes"]
+
+
+def test_signals_unavailable_returns_200_null_recommended(
+    client: TestClient,
+) -> None:
+    """Case g: When signals are all unavailable, recommended is null, reason_codes has fallback_static, HTTP is 200."""
+    client.app.state.signal_source = StubSignalSource(
+        result=SignalResult(signals={}, stale=True, degraded=True, fetched_at=None)
+    )
+    response = client.post(
+        "/v1/recommend",
+        json={"tier": "T2", "role": "implement"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["recommended"] is None
+    assert "fallback_static" in data["reason_codes"]
+    assert "no_eligible_candidate" in data["reason_codes"]
+
+
+def test_stale_signal_result_includes_stale_signals_reason_code(
+    client: TestClient,
+) -> None:
+    """When SignalResult has stale=True on cached signals, /v1/recommend includes stale_signals in reason_codes."""
+    fresh_signals = {
+        "claude": {
+            "usable": True,
+            "score": 90.0,
+            "level": "ok",
+            "cooling": False,
+            "seconds_until_reset": 3600,
+            "stale": False,
+        }
+    }
+    client.app.state.signal_source = StubSignalSource(
+        result=SignalResult(
+            signals=fresh_signals,
+            stale=True,
+            degraded=False,
+            fetched_at=datetime.now(timezone.utc),
+        )
+    )
+    response = client.post(
+        "/v1/recommend",
+        json={"tier": "T2", "role": "implement"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["recommended"] is not None
+    assert "stale_signals" in data["reason_codes"]
+
+
+def test_extra_unknown_fields_accepted(client: TestClient) -> None:
+    """Case h: Unknown additional fields must not cause 422 validation errors."""
+    response = client.post(
+        "/v1/recommend",
+        json={
+            "tier": "T2",
+            "role": "implement",
+            "zzz": 1,
+            "extra_field": "future_client_metadata",
+            "client": {
+                "available_vendors": ["openai"],
+                "unknown_nested_setting": True,
+            },
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["recommended"] is not None
+
+
+def test_signal_exception_returns_500_generic_error(client: TestClient) -> None:
+    """Case i: SignalSource.get throwing an exception returns 500 with exactly {'detail': 'internal error'}."""
+    client.app.state.signal_source = StubSignalSource(
+        raise_exc=RuntimeError("simulated database disconnect with secret_token_xyz")
+    )
+    response = client.post(
+        "/v1/recommend",
+        json={"tier": "T2", "role": "implement"},
+    )
+    assert response.status_code == 500
+    assert response.json() == {"detail": "internal error"}
+    assert "simulated database disconnect" not in response.text
+    assert "secret_token_xyz" not in response.text
+    assert "traceback" not in response.text.lower()
+
+
+def test_recommend_response_does_not_leak_internal_keys(
+    client: TestClient,
+) -> None:
+    """Case j: Structural contract verification ensuring no internal quota/pool keys or numeric quota metrics leak."""
+    response = client.post(
+        "/v1/recommend",
+        json={"tier": "T2", "role": "implement"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+
+    # 1. Exact allowed top-level keys
+    allowed_top_keys = {
+        "policy_version",
+        "generated_at",
+        "expires_at",
+        "tier",
+        "role",
+        "recommended",
+        "alternatives",
+        "reason_codes",
+        "wait_seconds",
+    }
+    assert set(data.keys()) == allowed_top_keys
+
+    # 2. recommended and alternatives keys strictly {vendor, model}
+    if data["recommended"] is not None:
+        assert set(data["recommended"].keys()) == {"vendor", "model"}
+        assert isinstance(data["recommended"]["vendor"], str)
+        assert isinstance(data["recommended"]["model"], str)
+
+    assert isinstance(data["alternatives"], list)
+    for alt in data["alternatives"]:
+        assert set(alt.keys()) == {"vendor", "model"}
+        assert isinstance(alt["vendor"], str)
+        assert isinstance(alt["model"], str)
+
+    # 3. reason_codes are strictly within the engine's fixed REASON_CODES set
+    from app.engine import REASON_CODES
+
+    assert isinstance(data["reason_codes"], list)
+    for code in data["reason_codes"]:
+        assert code in REASON_CODES
+
+    # 4. Recursively assert no float/int quota numeric values leak in unexpected places.
+    # Only wait_seconds may be int | None; all other values must be str, dict, list, or bool/None.
+    def assert_no_leaked_metrics(val: Any, path: str) -> None:
+        if path == "wait_seconds":
+            assert val is None or isinstance(val, int), f"wait_seconds must be int or None, got {type(val)}"
+            return
+        if isinstance(val, dict):
+            for k, v in val.items():
+                assert_no_leaked_metrics(v, f"{path}.{k}" if path else k)
+        elif isinstance(val, list):
+            for i, v in enumerate(val):
+                assert_no_leaked_metrics(v, f"{path}[{i}]")
+        else:
+            assert not isinstance(val, (int, float)), f"Leaked numeric metric at '{path}': {val}"
+
+    assert_no_leaked_metrics(data, "")
+
+
+def test_unknown_vendor_in_available_vendors_ignored(
+    client: TestClient,
+) -> None:
+    """Unrecognized vendor names are ignored while valid names in the same list are preserved."""
+    response = client.post(
+        "/v1/recommend",
+        json={
+            "tier": "T2",
+            "role": "implement",
+            "client": {"available_vendors": ["unsupported_cloud_ai", "anthropic"]},
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["recommended"] is not None
+    assert data["recommended"]["vendor"] == "claude"
+
+
+def test_recommend_audit_log_format_and_content(
+    client: TestClient, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit log records timestamp, tier, role, model, policy_version, status, elapsed."""
+    caplog.set_level(logging.INFO, logger="app.main")
+    response = client.post(
+        "/v1/recommend",
+        json={
+            "tier": "T2",
+            "role": "implement",
+            "client": {"available_vendors": ["openai"]},
+            "min_score": 10,
+        },
+    )
+    assert response.status_code == 200
+
+    service_logger = logging.getLogger("app")
+    recommend_logs = [
+        record
+        for record in caplog.records
+        if record.name == "app.main" and "recommend:" in record.getMessage()
+    ]
+    assert len(recommend_logs) == 1
+
+    log_msg = recommend_logs[0].getMessage()
+    assert "tier=T2" in log_msg
+    assert "role=implement" in log_msg
+    assert "model=" in log_msg
+    assert "policy_version=2026-09-15.1" in log_msg
+    assert "status=200" in log_msg
+    assert "elapsed=" in log_msg
+
+    # Must NOT log other request body contents or headers
+    assert "available_vendors" not in log_msg
+    assert "min_score" not in log_msg
+    assert "openai" not in log_msg
+
+    service_formatters = [
+        handler.formatter
+        for handler in service_logger.handlers
+        if handler.formatter is not None
+        and handler.formatter.datefmt == "%Y-%m-%dT%H:%M:%SZ"
+    ]
+    assert len(service_formatters) == 1
+    try:
+        with monkeypatch.context() as timezone_environment:
+            timezone_environment.setenv("TZ", "Asia/Taipei")
+            time.tzset()
+            if time.timezone == 0 and time.altzone == 0:
+                pytest.skip("tzdata not available in environment (e.g. python:3.14-slim without /usr/share/zoneinfo)")
+            record = recommend_logs[0]
+            expected_utc = datetime.fromtimestamp(
+                record.created, timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%S")
+            local_time = datetime.fromtimestamp(record.created).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            )
+            assert local_time != expected_utc
+            rendered_log = service_formatters[0].format(record)
+            assert rendered_log.startswith(
+                f"{expected_utc}Z [INFO] app.main: recommend:"
+            )
+    finally:
+        # Restore libc's cached timezone after monkeypatch restores the environment.
+        time.tzset()
+
+
+def test_recommend_audit_log_on_422_validation_failure(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verify audit log is also recorded across failure outcomes (422)."""
+    caplog.set_level(logging.INFO, logger="app.main")
+    service_logger = logging.getLogger("app")
+    service_logger.addHandler(caplog.handler)
+    try:
+        response = client.post(
+            "/v1/recommend", json={"tier": "T9", "role": "implement"}
+        )
+    finally:
+        service_logger.removeHandler(caplog.handler)
+    assert response.status_code == 422
+
+    recommend_logs = [
+        record
+        for record in caplog.records
+        if record.name == "app.main" and "recommend:" in record.message
+    ]
+    assert len(recommend_logs) == 1
+    assert "status=422" in recommend_logs[0].message
+
+
+def test_service_logging_does_not_enable_dependency_info() -> None:
+    """Service logs stay at INFO without enabling dependency request logging."""
+    assert logging.getLogger("app.main").isEnabledFor(logging.INFO)
+    assert logging.getLogger("app.signals").isEnabledFor(logging.INFO)
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
+    assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+
+
+def test_settings_security_default_localhost(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify safe localhost binding default (127.0.0.1:50100) when no environment override exists."""
+    monkeypatch.delenv("HOST", raising=False)
+    monkeypatch.delenv("PORT", raising=False)
+    s = Settings(_env_file=None)
+    assert s.host == "127.0.0.1"
+    assert s.port == 50100

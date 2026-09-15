@@ -1,0 +1,6 @@
+PyYAML
+pydantic
+fastapi
+uvicorn
+pydantic-settings
+httpx

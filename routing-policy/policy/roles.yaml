@@ -1,0 +1,12 @@
+schema_version: 1
+policy:
+  review:
+    cross_vendor: true
+# Descriptive ranking intent in v1: availability -> quota -> capability -> cost.
+# Note: The candidate sort key is hardcoded in engine.py to maintain exact parity
+# with legacy routing_view. Modifying this list does not alter engine sorting;
+# changing the ranking sequence requires updating engine.py.
+ranking: [availability, quota, capability, cost]
+orchestrator:
+  # agy may only supply gemini-* subagents and must never orchestrate.
+  excluded_vendors: [agy]

@@ -1,0 +1,9 @@
+schema_version: 1
+policy_version: "2026-09-15.1"
+tiers:
+  T0: {level: 0, complexity: [0, 2]}
+  T1: {level: 1, complexity: [3, 5]}
+  T2: {level: 2, complexity: [6, 8]}
+  T3: {level: 3, complexity: [9, 12]}
+review:
+  role: review
