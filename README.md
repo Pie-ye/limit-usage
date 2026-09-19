@@ -26,7 +26,7 @@
 - Claude 活動探測（只看 `~/.claude/projects` mtime）。`app/services/claude_activity.py`
 - 主機周邊 companion API：UPS（`app/services/ups.py`，`upower -i`）、三主機備份健康、本月刷卡、演唱會追蹤——後三者只讀 n8n／backup 產出的 JSON
 - 儀表板前端：`app/web/templates/index.html`、`app/web/static/app.js`（Chart.js）、`style.css`
-- 子服務 routing-policy：純政策決策層，無憑證，可走 Cloudflare Tunnel。`routing-policy/`
+- 子服務 routing-policy：純政策決策層，無憑證。公網 `routing.piea.uk` 經 CF Tunnel + Access → homepage-edge → `:50100`。`routing-policy/`
 - 一次性 Google OAuth 登入工具。`scripts/antigravity_login.py`
 
 儀表板會話：週額度剩餘 ≤20%／≤10% 或重置倒數 2h／30m 時紅字；DeepSeek 餘額低於 10 CNY 警告；7 日折線與 light／medium／heavy 工作量估算。
