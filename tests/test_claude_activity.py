@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+import json
 import os
 import time
+
+import httpx
+import pytest
+import respx
 
 from app.providers.claude import (
     DEFAULT_OAUTH_ACTIVE_INTERVAL_SECONDS,
     DEFAULT_OAUTH_MIN_INTERVAL_SECONDS,
+    USAGE_URL,
     ClaudeProvider,
 )
 from app.services.claude_activity import ClaudeActivityProbe
@@ -122,3 +129,67 @@ def test_active_interval_never_exceeds_the_idle_one(tmp_path):
         activity_probe=StubProbe(True),
     )
     assert provider._oauth_interval() == 120
+
+
+def _write_creds(path):
+    path.write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "tok", "subscriptionType": "max"}}),
+        encoding="utf-8",
+    )
+    return path
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = datetime(2026, 9, 23, 12, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_becoming_active_shortens_an_interval_chosen_while_idle(tmp_path, monkeypatch):
+    """An OAuth call made while idle must not pin the next one 30 min out once
+    Claude Code starts working again."""
+    clock = Clock()
+    monkeypatch.setattr("app.providers.claude.utcnow", clock)
+    route = respx.get(USAGE_URL).mock(
+        return_value=httpx.Response(
+            200, json={"limits": [{"kind": "session", "percent": 10, "resets_at": "2026-09-24T00:00:00Z"}]}
+        )
+    )
+    probe = StubProbe(False)
+    provider = ClaudeProvider(_write_creds(tmp_path / "creds.json"), activity_probe=probe)
+    await provider.fetch()
+    assert route.call_count == 1
+
+    probe.active = True
+    clock.now += timedelta(seconds=DEFAULT_OAUTH_ACTIVE_INTERVAL_SECONDS - 1)
+    await provider.fetch()
+    assert route.call_count == 1
+
+    clock.now += timedelta(seconds=2)
+    await provider.fetch()
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_activity_never_shortens_a_rate_limit_backoff(tmp_path, monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr("app.providers.claude.utcnow", clock)
+    route = respx.get(USAGE_URL).mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "3600"})
+    )
+    provider = ClaudeProvider(
+        _write_creds(tmp_path / "creds.json"), activity_probe=StubProbe(True)
+    )
+    await provider.fetch()
+    clock.now += timedelta(seconds=3599)
+    await provider.fetch()
+    assert route.call_count == 1
+
+    clock.now += timedelta(seconds=2)
+    await provider.fetch()
+    assert route.call_count == 2

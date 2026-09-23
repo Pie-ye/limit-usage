@@ -409,7 +409,7 @@ async def test_claude_provider_oauth_429_message_names_local_reasons(tmp_path: P
     snapshot = await provider.fetch()
     assert snapshot.status == SnapshotStatus.RATE_LIMITED
     assert provider.retry_after_seconds is None
-    assert provider._oauth_next_attempt_at >= before + timedelta(seconds=3600)
+    assert provider._oauth_next_attempt_at() >= before + timedelta(seconds=3600)
     assert "local sources:" in (snapshot.message or "")
 
 

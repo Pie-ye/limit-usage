@@ -491,7 +491,12 @@ class ClaudeProvider:
         self.activity_probe = activity_probe
         self.min_interval_seconds = LOCAL_MIN_INTERVAL_SECONDS
         self.retry_after_seconds: int | None = None
-        self._oauth_next_attempt_at: datetime | None = None
+        # The next allowed OAuth call is derived on every fetch rather than
+        # fixed at attempt time, so an idle->active switch takes effect at once
+        # instead of waiting out an interval chosen while idle.
+        self._oauth_last_attempt_at: datetime | None = None
+        # Server-imposed (429) floor; never shortened by activity.
+        self._oauth_backoff_until: datetime | None = None
         self._last_oauth_snapshot: AccountSnapshot | None = None
 
     def _read_local_source(
@@ -540,6 +545,14 @@ class ClaudeProvider:
         # Never let the "fast" path end up slower than the idle one, however the
         # two settings are configured.
         return min(self.oauth_active_interval_seconds, self.oauth_min_interval_seconds)
+
+    def _oauth_next_attempt_at(self) -> datetime | None:
+        if self._oauth_last_attempt_at is None:
+            return None
+        ready = self._oauth_last_attempt_at + timedelta(seconds=self._oauth_interval())
+        if self._oauth_backoff_until is not None:
+            ready = max(ready, self._oauth_backoff_until)
+        return ready
 
     def _read_remote_sources(
         self, *, now: datetime
@@ -704,8 +717,9 @@ class ClaudeProvider:
                 source="credentials",
             )
 
-        if self._oauth_next_attempt_at is not None and now < self._oauth_next_attempt_at:
-            wait = (self._oauth_next_attempt_at - now).total_seconds()
+        next_attempt_at = self._oauth_next_attempt_at()
+        if next_attempt_at is not None and now < next_attempt_at:
+            wait = (next_attempt_at - now).total_seconds()
             if self._last_oauth_snapshot is not None:
                 age = (now - self._last_oauth_snapshot.fetched_at).total_seconds()
                 return self._last_oauth_snapshot.model_copy(
@@ -726,7 +740,7 @@ class ClaudeProvider:
                 source=OAUTH_SOURCE,
             )
 
-        self._oauth_next_attempt_at = now + timedelta(seconds=self._oauth_interval())
+        self._oauth_last_attempt_at = now
 
         headers = {**USAGE_HEADERS, "Authorization": f"Bearer {access_token}"}
         try:
@@ -745,7 +759,7 @@ class ClaudeProvider:
         http_status = resp.status_code
         if http_status == 429:
             wait = parse_retry_after(resp.headers.get("Retry-After"))
-            self._oauth_next_attempt_at = now + timedelta(
+            self._oauth_backoff_until = now + timedelta(
                 seconds=max(wait or 0, self.oauth_min_interval_seconds)
             )
             logger.warning(
