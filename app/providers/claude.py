@@ -26,6 +26,7 @@ USAGE_HEADERS = {
     "User-Agent": "limit-usage/0.1",
 }
 
+STREAM_SOURCE = "stream"
 STATUSLINE_SOURCE = "statusline"
 USAGE_CACHE_SOURCE = "claude-code-cache"
 OAUTH_SOURCE = "oauth/usage"
@@ -39,6 +40,10 @@ DEFAULT_OAUTH_MIN_INTERVAL_SECONDS = 1800
 # endpoint tolerates from a single caller.
 DEFAULT_OAUTH_ACTIVE_INTERVAL_SECONDS = 180
 OFFICIAL_MAX_AGE_SECONDS = 21600
+# Treat a token this close to expiry as expired: the call would race Claude
+# Code's own refresh and an expired token is answered with 401 and then a long
+# 429, not a clean error.
+TOKEN_EXPIRY_SKEW_SECONDS = 60
 FRESH_MESSAGE_THRESHOLD_SECONDS = 900
 FIVE_HOUR_SECONDS = 18000
 WEEK_SECONDS = 604800
@@ -220,6 +225,12 @@ def _epoch_datetime(value: Any) -> datetime | None:
         return datetime.fromtimestamp(value, tz=timezone.utc)
     except (OverflowError, OSError, ValueError):
         return None
+
+
+def _epoch_ms_datetime(value: Any) -> datetime | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return _epoch_datetime(value / 1000)
 
 
 def _statusline_used(value: Any) -> float | None:
@@ -470,6 +481,7 @@ class ClaudeProvider:
         *,
         statusline_capture_path: Path | None = None,
         usage_cache_path: Path | None = None,
+        stream_capture_path: Path | None = None,
         official_max_age_seconds: int = OFFICIAL_MAX_AGE_SECONDS,
         oauth_min_interval_seconds: int = DEFAULT_OAUTH_MIN_INTERVAL_SECONDS,
         oauth_active_interval_seconds: int = DEFAULT_OAUTH_ACTIVE_INTERVAL_SECONDS,
@@ -480,6 +492,9 @@ class ClaudeProvider:
         self.timeout = timeout
         self.statusline_capture_path = statusline_capture_path
         self.usage_cache_path = usage_cache_path
+        # Written by deploy/claude_rate_tap.py from headless sessions' stream-json
+        # rate_limit_event; same format as the statusline capture.
+        self.stream_capture_path = stream_capture_path
         # Supplied by RemoteClaudeRegistry.entries. A callable rather than the
         # registry itself so the provider keeps no opinion about where pushes
         # are stored, and tests can hand it a plain list.
@@ -498,6 +513,9 @@ class ClaudeProvider:
         # Server-imposed (429) floor; never shortened by activity.
         self._oauth_backoff_until: datetime | None = None
         self._last_oauth_snapshot: AccountSnapshot | None = None
+        # Credentials file fingerprint that last got a 401. Retrying with the
+        # same token cannot succeed and only arms the endpoint's 429.
+        self._oauth_rejected_credentials: tuple[float, Any] | None = None
 
     def _read_local_source(
         self,
@@ -554,6 +572,31 @@ class ClaudeProvider:
             ready = max(ready, self._oauth_backoff_until)
         return ready
 
+    def _credentials_fingerprint(self, data: dict[str, Any]) -> tuple[float, Any]:
+        try:
+            mtime = self.credentials_path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        oauth = data.get("claudeAiOauth")
+        expires_at = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+        return mtime, expires_at
+
+    def _stale_oauth(self, now: datetime, reason: str, hint: str | None) -> AccountSnapshot:
+        """Serve the last OAuth reading (or an error) without calling out."""
+        if self._last_oauth_snapshot is not None:
+            age = (now - self._last_oauth_snapshot.fetched_at).total_seconds()
+            return self._last_oauth_snapshot.model_copy(
+                update={"message": f"沿用 {format_age(age)}前的 OAuth 額度（{reason}）"}
+            )
+        return error_snapshot(
+            self.provider_id,
+            self.display_name,
+            SnapshotStatus.AUTH_ERROR,
+            reason,
+            account_hint=hint,
+            source=OAUTH_SOURCE,
+        )
+
     def _read_remote_sources(
         self, *, now: datetime
     ) -> list[tuple[str, datetime | None, list[UsageWindow], str | None]]:
@@ -608,6 +651,7 @@ class ClaudeProvider:
         hint: str | None = None
         creds_error: tuple[SnapshotStatus, str] | None = None
         access_token: str | None = None
+        credentials: dict[str, Any] = {}
         if not self.credentials_path or not self.credentials_path.is_file():
             creds_error = (
                 SnapshotStatus.AUTH_ERROR,
@@ -621,6 +665,7 @@ class ClaudeProvider:
             except Exception as exc:
                 creds_error = (SnapshotStatus.ERROR, f"Failed to read credentials: {exc}")
             else:
+                credentials = data
                 status, msg, access_token, hint = extract_claude_oauth(data)
                 if status != SnapshotStatus.OK or not access_token:
                     creds_error = (status, msg)
@@ -629,6 +674,12 @@ class ClaudeProvider:
         local_sources: list[tuple[str, datetime, list[UsageWindow]]] = []
         local_reasons: list[str] = []
         local_sources_spec = [
+            (
+                STREAM_SOURCE,
+                "stream capture",
+                self.stream_capture_path,
+                parse_statusline_capture,
+            ),
             (
                 STATUSLINE_SOURCE,
                 "statusline capture",
@@ -740,6 +791,28 @@ class ClaudeProvider:
                 source=OAUTH_SOURCE,
             )
 
+        expires_at = _epoch_ms_datetime(
+            (credentials.get("claudeAiOauth") or {}).get("expiresAt")
+        )
+        if expires_at is not None and now >= expires_at - timedelta(
+            seconds=TOKEN_EXPIRY_SKEW_SECONDS
+        ):
+            expired = (
+                f"token 已於 {format_age((now - expires_at).total_seconds())}前過期"
+                if now >= expires_at
+                else "token 即將過期"
+            )
+            return self._stale_oauth(
+                now, f"{expired}，等待 Claude Code 刷新；本地來源：{local_note}", hint
+            )
+        fingerprint = self._credentials_fingerprint(credentials)
+        if self._oauth_rejected_credentials == fingerprint:
+            return self._stale_oauth(
+                now,
+                f"token 被拒（401），等待 Claude Code 刷新；本地來源：{local_note}",
+                hint,
+            )
+
         self._oauth_last_attempt_at = now
 
         headers = {**USAGE_HEADERS, "Authorization": f"Bearer {access_token}"}
@@ -778,6 +851,7 @@ class ClaudeProvider:
                 source=OAUTH_SOURCE,
             )
         if http_status in (401, 403):
+            self._oauth_rejected_credentials = fingerprint
             err = (resp.text or resp.reason_phrase or "")[:300]
             return error_snapshot(
                 self.provider_id,

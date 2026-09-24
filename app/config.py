@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     claude_credentials_path: str = "~/.claude/.credentials.json"
     claude_statusline_capture_path: str = "~/.claude-monitor/statusline/latest.json"
     claude_usage_cache_path: str = "~/.claude-monitor/state/claude-code-usage.json"
+    claude_stream_capture_path: str = "~/.claude-monitor/stream/latest.json"
     claude_official_max_age_seconds: int = Field(default=21600, ge=60)
     claude_oauth_min_interval_seconds: int = Field(default=1800, ge=60)
     # Claude Code appends to these transcripts once per API response, including
@@ -75,6 +76,13 @@ class Settings(BaseSettings):
         return (
             expand_path(self.claude_statusline_capture_path)
             or Path.home() / ".claude-monitor" / "statusline" / "latest.json"
+        )
+
+    @property
+    def claude_stream_capture(self) -> Path:
+        return (
+            expand_path(self.claude_stream_capture_path)
+            or Path.home() / ".claude-monitor" / "stream" / "latest.json"
         )
 
     @property

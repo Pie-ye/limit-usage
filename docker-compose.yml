@@ -30,6 +30,8 @@ services:
       CLAUDE_CREDENTIALS_PATH: "/secrets/claude/.credentials.json"
       CLAUDE_STATUSLINE_CAPTURE_PATH: "/secrets/claude-monitor/statusline/latest.json"
       CLAUDE_USAGE_CACHE_PATH: "/secrets/claude-monitor/state/claude-code-usage.json"
+      # Written by deploy/claude-rate-tap from headless (codeg) sessions.
+      CLAUDE_STREAM_CAPTURE_PATH: "/secrets/claude-monitor/stream/latest.json"
       # Already inside the ~/.claude mount below. Only the newest mtime is read
       # (never the contents) to decide whether anyone is spending quota right
       # now, which paces the OAuth fallback.

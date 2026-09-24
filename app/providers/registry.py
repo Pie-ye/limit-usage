@@ -32,6 +32,7 @@ def build_providers(
             timeout=timeout,
             statusline_capture_path=settings.claude_statusline_capture,
             usage_cache_path=settings.claude_usage_cache,
+            stream_capture_path=settings.claude_stream_capture,
             official_max_age_seconds=settings.claude_official_max_age_seconds,
             oauth_min_interval_seconds=settings.claude_oauth_min_interval_seconds,
             oauth_active_interval_seconds=settings.claude_oauth_active_interval_seconds,

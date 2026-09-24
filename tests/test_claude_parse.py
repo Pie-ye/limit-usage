@@ -13,6 +13,7 @@ from app.providers.claude import (
     FIVE_HOUR_SECONDS,
     OAUTH_SOURCE,
     STATUSLINE_SOURCE,
+    STREAM_SOURCE,
     USAGE_CACHE_SOURCE,
     USAGE_URL,
     WEEK_SECONDS,
@@ -567,3 +568,85 @@ async def test_claude_provider_fetch_no_access_token_reports_credentials_error(t
     assert snapshot.status == SnapshotStatus.AUTH_ERROR
     assert snapshot.source == "credentials"
     assert "local sources:" in (snapshot.message or "")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_serves_stream_capture_without_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 9, 24, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.providers.claude.utcnow", lambda: now)
+    route = respx.get(USAGE_URL).mock(return_value=httpx.Response(500))
+    stream = _write_json(tmp_path / "stream.json", _statusline_payload(now, age_seconds=30))
+    provider = ClaudeProvider(
+        _write_creds(tmp_path / "creds.json"),
+        stream_capture_path=stream,
+        statusline_capture_path=tmp_path / "missing-capture.json",
+        usage_cache_path=tmp_path / "missing-cache.json",
+    )
+    snapshot = await provider.fetch()
+    assert not route.called
+    assert snapshot.source == STREAM_SOURCE
+    assert {"5h", "1w", "1w-fable"} <= {window.key for window in snapshot.windows}
+
+
+def _write_expiring_creds(path: Path, expires_at: datetime) -> Path:
+    return _write_json(
+        path,
+        {"claudeAiOauth": {"accessToken": "sk-ant-test", "expiresAt": expires_at.timestamp() * 1000}},
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_skips_oauth_with_expired_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An expired token earns 401s and then an hour-long 429; wait for Claude
+    Code to refresh it instead."""
+    now = datetime(2026, 9, 24, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.providers.claude.utcnow", lambda: now)
+    route = respx.get(USAGE_URL).mock(return_value=httpx.Response(401))
+    creds = _write_expiring_creds(tmp_path / "creds.json", now - timedelta(minutes=5))
+    provider = ClaudeProvider(creds)
+    snapshot = await provider.fetch()
+    assert not route.called
+    assert snapshot.status == SnapshotStatus.AUTH_ERROR
+    assert "過期" in (snapshot.message or "")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_keeps_last_reading_while_token_expired(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": datetime(2026, 9, 24, 12, tzinfo=timezone.utc)}
+    monkeypatch.setattr("app.providers.claude.utcnow", lambda: clock["now"])
+    route = respx.get(USAGE_URL).mock(
+        return_value=httpx.Response(
+            200, json={"limits": [{"kind": "session", "percent": 12, "resets_at": "2026-09-25T00:00:00Z"}]}
+        )
+    )
+    creds = _write_expiring_creds(tmp_path / "creds.json", clock["now"] + timedelta(hours=1))
+    provider = ClaudeProvider(creds)
+    first = await provider.fetch()
+    clock["now"] += timedelta(hours=2)
+    second = await provider.fetch()
+    assert route.call_count == 1
+    assert second.status == SnapshotStatus.OK
+    assert second.windows == first.windows
+    assert "等待 Claude Code 刷新" in (second.message or "")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_claude_provider_waits_for_new_credentials_after_401(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": datetime(2026, 9, 24, 12, tzinfo=timezone.utc)}
+    monkeypatch.setattr("app.providers.claude.utcnow", lambda: clock["now"])
+    route = respx.get(USAGE_URL).mock(return_value=httpx.Response(401))
+    creds = _write_expiring_creds(tmp_path / "creds.json", clock["now"] + timedelta(hours=8))
+    provider = ClaudeProvider(creds)
+    await provider.fetch()
+    clock["now"] += timedelta(hours=1)
+    blocked = await provider.fetch()
+    assert route.call_count == 1
+    assert "401" in (blocked.message or "")
+
+    _write_expiring_creds(creds, clock["now"] + timedelta(hours=8))  # Claude Code refreshed
+    await provider.fetch()
+    assert route.call_count == 2

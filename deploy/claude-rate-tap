@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Stand-in for the Claude Code binary that claude-agent-acp spawns for codeg.
+# Enabled through CLAUDE_CODE_EXECUTABLE (see deploy/codeg-claude-rate-tap.conf).
+#
+# The real binary is exec'd, so it keeps this PID (the SDK signals it directly),
+# reads stdin directly and returns its own exit code. Only stdout goes through
+# claude_rate_tap.py, which forwards every byte and records rate_limit_event
+# windows for the limit-usage Claude card. If the tap cannot run, Claude runs
+# untapped rather than not at all.
+REAL="${CLAUDE_RATE_TAP_REAL:-$HOME/.local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude}"
+TAP="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/claude_rate_tap.py"
+PYTHON="$(command -v python3)"
+
+if [[ -n "$PYTHON" && -r "$TAP" ]]; then
+    exec "$REAL" "$@" > >(exec "$PYTHON" "$TAP")
+fi
+exec "$REAL" "$@"

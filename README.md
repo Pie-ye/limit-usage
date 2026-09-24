@@ -15,7 +15,7 @@
   - SuperGrok：`app/providers/supergrok.py`（gRPC-web protobuf 手刻解碼、OIDC refresh 並回寫 `~/.grok/auth.json`）
   - DeepSeek：`app/providers/deepseek.py`（`/user/balance` 餘額 CNY）
   - Antigravity（Google Cloud Code）：`app/providers/antigravity.py`（配額 bucket，分 Gemini／3P 兩族）
-  - Claude：`app/providers/claude.py`（statusline capture、Claude Code usage cache、OAuth fallback 三來源合併）
+  - Claude：`app/providers/claude.py`（stream capture、statusline capture、Claude Code usage cache、OAuth fallback 合併）
 - 背景輪詢器：每供應商 min-interval、指數退避、遵守 `Retry-After`、失敗時沿用上次好資料。`app/services/poller.py`
 - SQLite 快照＋歷史。`app/db/repository.py`
 - 7 日趨勢與燃燒率工作量估算。`app/services/analytics.py`
@@ -178,17 +178,19 @@ Codex 走 `GET https://chatgpt.com/backend-api/wham/usage`，視窗依 `limit_wi
 
 ### Claude 額度來源
 
-Anthropic 的 `api/oauth/usage` 每帳號限流。每個正在跑的 Claude Code session 已經在輪詢它。背景 poller 再打一次會拿到 `429` 與 `Retry-After: 3600`，Claude 卡會停一小時。所以卡片優先讀 Claude Code 工具已經在寫的兩個本機檔，OAuth 只當最後手段。
+Anthropic 的 `api/oauth/usage` 每帳號限流。每個正在跑的 Claude Code session 已經在輪詢它。背景 poller 再打一次會拿到 `429` 與 `Retry-After: 3600`，Claude 卡會停一小時。所以卡片優先讀 Claude Code 工具已經在寫的本機檔，OAuth 只當最後手段。
+
+**來源 S — stream capture（主力）。** headless Claude Code（`--output-format stream-json`，codeg 經 claude-agent-acp 起的 session）每當視窗的四捨五入百分比或重置時間變動，就在 stdout 印一行 `rate_limit_event`。其中 `rate_limit_info.unifiedWindows` 直接取自 `anthropic-ratelimit-unified-*` 回應 header：`five_hour`、`seven_day`，以及 `seven_day_overage_included`（只在 Fable 回應出現，就是 Fable 週額度）。不需額外 API 呼叫。`deploy/claude-rate-tap` 經 codeg 的 `CLAUDE_CODE_EXECUTABLE` 取代 Claude 執行檔：`exec` 真正的 binary，只把 stdout 導過 `deploy/claude_rate_tap.py`。該腳本逐 byte 原樣轉發，另把事件以 statusline capture 格式逐視窗合併寫入 `~/.claude-monitor/stream/latest.json`。tap 出任何錯都吞掉，不影響 session。header 的數值比 OAuth 端點少約 1 個百分點（捨入差異）。
 
 **來源 A — statusline capture。** Claude Code 把官方 `rate_limits` 區塊（`five_hour` / `seven_day` / `spend_limit`，新版還有 `model_scoped`）交給 status line script 的 stdin。[claude-monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor)（MIT）`--statusline` hook 原樣寫進 `~/.claude-monitor/statusline/latest.json`。`ClaudeProvider` 直接讀這個檔，不走 claude-monitor 的 `--write-state`（600 秒後會降成 token-count `local_estimate`）。限制：只有互動 TUI 有活動時才更新。Headless／SDK／ACP session 不畫 status line，也就不寫檔。
 
 **來源 B — Claude Code 自己的 usage cache。** Claude Code 把 usage 端點回應快取在 `~/.claude.json` 的 `cachedUsageUtilization`（含 Fable `weekly_scoped`）。最多每 5 分鐘重抓，且只在 TUI 啟動或開對話時。`deploy/claude-usage-cache-sync.py` 由 systemd user timer 每 2 分鐘把該 key 拷到 `~/.claude-monitor/state/claude-code-usage.json`。原因：Claude Code 用 rename 改寫檔案，單檔 bind mount 會釘在舊 inode。
 
-**合併規則。** 兩個來源只要新於 `CLAUDE_OFFICIAL_MAX_AGE_SECONDS` 就合格；每個視窗（5h／週／Fable）取較新的合格來源。卡片 `source` 回報 `statusline`、`claude-code-cache` 或 `statusline+claude-code-cache`。資料超過 15 分鐘，`message` 會用中文標「官方額度資料為 N 分鐘前」。
+**合併規則。** 各來源只要新於 `CLAUDE_OFFICIAL_MAX_AGE_SECONDS` 就合格；每個視窗（5h／週／Fable）取較新的合格來源。卡片 `source` 以 `+` 串接實際貢獻的來源，例如 `stream`、`statusline+claude-code-cache`。資料超過 15 分鐘，`message` 會用中文標「官方額度資料為 N 分鐘前」。
 
 **Rollover。** 視窗 `resets_at` 過後，卡片對該視窗顯示 0%，而不是消失：5 小時視窗不再顯示重置時間，週視窗的重置往後推 7 天。
 
-**來源 C — OAuth fallback。** 兩個本機來源都沒有可用的 5 小時或週視窗才打 OAuth。最多每 `CLAUDE_OAUTH_MIN_INTERVAL_SECONDS` 一次，並遵守 `429` 的 `Retry-After`。限流期間繼續提供上次 OAuth 結果，`message` 註明年齡（「沿用 N 分鐘前的 OAuth 額度」）。本機檔每個 poll 仍重讀，一有新資料就切回去。走 OAuth 時 `source` 為 `oauth/usage`。
+**來源 C — OAuth fallback。** 本機來源都沒有可用的 5 小時或週視窗才打 OAuth。最多每 `CLAUDE_OAUTH_MIN_INTERVAL_SECONDS` 一次，並遵守 `429` 的 `Retry-After`。限流期間繼續提供上次 OAuth 結果，`message` 註明年齡（「沿用 N 分鐘前的 OAuth 額度」）。token 已過期（`expiresAt`）或上次被 `401` 拒絕且憑證檔未變時不發請求，等 Claude Code 刷新 token：過期 token 打這個端點會先 `401`、再換來一小時的 `429`。本機檔每個 poll 仍重讀，一有新資料就切回去。走 OAuth 時 `source` 為 `oauth/usage`。
 
 #### 踩雷：絕不可單檔 bind mount 憑證
 
@@ -210,6 +212,10 @@ inode 不同就是 mount 過期。同樣陷阱適用任何 host 工具會 rename
 設定：
 
 ```bash
+# 0. stream tap — 讓 codeg 起的 Claude 經過 deploy/claude-rate-tap（重啟 codeg 會中斷所有 session）
+install -Dm644 deploy/codeg-claude-rate-tap.conf ~/.config/systemd/user/codeg.service.d/claude-rate-tap.conf
+systemctl --user daemon-reload && systemctl --user restart codeg
+
 uv tool install claude-monitor
 
 # 1. status line hook — 加到 ~/.claude/settings.json
@@ -227,6 +233,7 @@ systemctl --user restart limit-usage-claude-monitor.service   # 立刻拷一次
 
 ```bash
 curl -sS http://127.0.0.1:50048/api/usage | jq '.snapshots[] | select(.provider=="claude") | .source'
+# "stream"
 # "statusline"
 # "claude-code-cache"
 # "statusline+claude-code-cache"
@@ -387,7 +394,7 @@ limit-usage/
 
 - compose 一定要走 `with-infisical`。直接 `docker compose up` 會把 `DEEPSEEK_API_KEY` 變成空字串。
 - 憑證檔絕不可單檔 bind mount（Claude Code rename 輪換；8 小時後 401，只有重建容器能救）。
-- Claude OAuth 每帳號限流 `Retry-After: 3600`；statusline 只在互動 TUI 更新，headless／SDK 不寫 → 卡片可能落回 OAuth。
+- Claude OAuth 每帳號限流 `Retry-After: 3600`；statusline 只在互動 TUI 更新。headless session 靠 stream tap；不經 codeg 的 headless 呼叫（例如直接 `claude -p`）不會被 tap，全都沒有時卡片落回 OAuth。
 - Claude 額度是帳號級、檔案是機器級：他機用量不推送會樂觀錯誤，`/api/routing` 會派到已耗盡的池。
 - tailnet 綁定冷開機可能失敗；published port 繞過 ufw，絕不可綁 `0.0.0.0`。
 - Grok token 約 6 小時過期，mount 必須 `:rw`；失敗要手動 `grok login`。
