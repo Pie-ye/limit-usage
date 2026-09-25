@@ -166,7 +166,11 @@ def test_recommend_normal_path_ttl_difference(client: TestClient) -> None:
     assert set(data.keys()) == expected_keys
     assert data["policy_version"] == "2026-09-26.1"
     assert data["recommended"] is not None
-    assert "effort" in data["recommended"]
+    assert data["recommended"]["effort"] == "max"
+    selected_model = data["recommended"]["model"]
+    assert data["recommended"]["effort"] == (
+        client.app.state.policy.models[selected_model].effort
+    )
 
     gen_dt = datetime.fromisoformat(data["generated_at"].replace("Z", "+00:00"))
     exp_dt = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))

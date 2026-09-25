@@ -119,7 +119,7 @@ def _build_synthetic_policy(tmp_path: Path) -> tuple[Policy, Catalog]:
                 "codex", ["5h", "1w"], 82, 2.0, effort="high"
             ),
             "model-codex-top": _catalog_model(
-                "codex", ["5h", "1w"], 90, 4.0, effort="max"
+                "codex", ["5h", "1w"], 90, 4.0, effort="xhigh"
             ),
             "model-grok-mid": _catalog_model("grok", ["1w"], 77, 2.0),
             "model-grok-top": _catalog_model(
@@ -129,10 +129,10 @@ def _build_synthetic_policy(tmp_path: Path) -> tuple[Policy, Catalog]:
                 "claude", ["5h", "1w"], 60, 1.0
             ),
             "model-claude-mid": _catalog_model(
-                "claude", ["5h", "1w"], 80, 2.0
+                "claude", ["5h", "1w"], 80, 2.0, effort="medium"
             ),
             "model-claude-top": _catalog_model(
-                "claude", ["5h", "1w"], 92, 5.0
+                "claude", ["5h", "1w"], 92, 5.0, effort="max"
             ),
             "model-claude-planner": _catalog_model(
                 "claude",
@@ -641,7 +641,23 @@ def test_response_includes_effort_with_minimal_surface(policy: Policy) -> None:
     rec = recommend(policy, _default_signals(), tier="T2", role="implement")
     assert rec.recommended is not None
     assert set(rec.recommended) == {"vendor", "model", "effort"}
-    assert "effort" in rec.recommended
+    assert rec.recommended == {
+        "vendor": "claude",
+        "model": "model-claude-top",
+        "effort": "max",
+    }
+    assert rec.recommended["effort"] == policy.models["model-claude-top"].effort
+
+    assert [
+        (alternative["model"], alternative["effort"])
+        for alternative in rec.alternatives
+    ] == [
+        ("model-claude-mid", "medium"),
+        ("model-codex-top", "xhigh"),
+        ("model-codex-mid", "high"),
+    ]
     for alternative in rec.alternatives:
         assert set(alternative) == {"vendor", "model", "effort"}
-        assert "effort" in alternative
+        model_id = alternative["model"]
+        assert isinstance(model_id, str)
+        assert alternative["effort"] == policy.models[model_id].effort
