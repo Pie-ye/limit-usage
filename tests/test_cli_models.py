@@ -285,9 +285,19 @@ def test_wait_seconds_delisted_and_missing(fake_catalog):
         missing_models=missing_models,
         catalog=fake_catalog,
     )
+    # Delisted model: listed is False in models, usable/eligible False in candidate, wait_seconds None
+    assert out["models"]["model-codex-top"]["listed"] is False
+    assert out["models"]["model-codex-top"]["usable"] is False
     t0_candidates = {c["model"]: c for c in out["tiers"]["T0"]["candidates"]}
-    assert t0_candidates["model-codex-top"]["listed"] is False if "listed" in t0_candidates["model-codex-top"] else True
+    assert t0_candidates["model-codex-top"]["usable"] is False
+    assert t0_candidates["model-codex-top"]["eligible"] is False
     assert t0_candidates["model-codex-top"]["wait_seconds"] is None
+    assert out["tiers"]["T0"]["recommended"] != "model-codex-top"
 
+    # Missing model: missing in models, usable/eligible False in candidate, wait_seconds == seconds_left
+    assert out["models"]["model-c-top"]["missing"] is not None
+    assert out["models"]["model-c-top"]["usable"] is False
     t3_candidates = {c["model"]: c for c in out["tiers"]["T3"]["candidates"]}
+    assert t3_candidates["model-c-top"]["usable"] is False
+    assert t3_candidates["model-c-top"]["eligible"] is False
     assert t3_candidates["model-c-top"]["wait_seconds"] == 86400
