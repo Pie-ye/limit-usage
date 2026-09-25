@@ -129,12 +129,13 @@ class RecommendRequest(BaseModel):
 
 
 class ModelTarget(BaseModel):
-    """Public model identifier paired with its owning vendor pool."""
+    """Public model identifier, vendor pool, and recommended effort."""
 
     model_config = ConfigDict(extra="forbid")
 
     vendor: str
     model: str
+    effort: str | None = None
 
 
 class RecommendResponse(BaseModel):
@@ -366,6 +367,7 @@ async def recommend_model(
         min_score=body.min_score,
         now=now_utc,
         signals_stale=signal_result.stale,
+        model_usable=signal_result.models,
     )
 
     # Format ISO 8601 UTC timestamps with explicit Z suffix.
@@ -377,13 +379,18 @@ async def recommend_model(
         ModelTarget(
             vendor=rec.recommended["vendor"],
             model=rec.recommended["model"],
+            effort=rec.recommended["effort"],
         )
         if rec.recommended is not None
         else None
     )
 
     alternative_targets = [
-        ModelTarget(vendor=alt["vendor"], model=alt["model"])
+        ModelTarget(
+            vendor=alt["vendor"],
+            model=alt["model"],
+            effort=alt["effort"],
+        )
         for alt in rec.alternatives
     ]
 

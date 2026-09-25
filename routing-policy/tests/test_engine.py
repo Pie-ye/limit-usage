@@ -1,27 +1,24 @@
-"""Tests for the pure functional routing policy recommendation engine.
-
-Exercises candidate ranking, role-based filtering, cross-vendor review restrictions,
-static ladder fallback indicators, and parity against the legacy routing view without
-making network calls or modifying persistent policy definitions.
-"""
+"""Tests for the pure functional routing policy recommendation engine."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+import shutil
 import sys
 import types
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 ROUTING_POLICY_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = ROUTING_POLICY_ROOT.parent
 sys.path.insert(0, str(ROUTING_POLICY_ROOT))
 
-from app.engine import REASON_CODES, Recommendation, recommend  # noqa: E402
+from app.engine import REASON_CODES, recommend  # noqa: E402
 from app.policy import Model, Policy, load_policy  # noqa: E402
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 import app as routing_policy_app  # noqa: E402
@@ -30,85 +27,187 @@ LEGACY_APP_PATH = REPO_ROOT / "app"
 if str(LEGACY_APP_PATH) not in routing_policy_app.__path__:
     routing_policy_app.__path__.append(str(LEGACY_APP_PATH))
 
-# The legacy package initializer imports the poller and database even though
-# parity only needs the pure routing module. A package shim keeps this focused
-# test independent of optional SQLite support in the Python runtime.
+# Both services use the package name ``app``. Extend the routing-policy package
+# and shim the legacy services package so this test can exercise both pure APIs.
 legacy_services = types.ModuleType("app.services")
 legacy_services.__path__ = [str(LEGACY_APP_PATH / "services")]
 sys.modules["app.services"] = legacy_services
 
 from app.models import AccountSnapshot, ProviderId, SnapshotStatus, UsageWindow  # noqa: E402
 from app.services.routing_view import build_routing_payload  # noqa: E402
+from catalog.tiering import Catalog, load_catalog  # noqa: E402
 
 POLICY_DIR = ROUTING_POLICY_ROOT / "policy"
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
+def _catalog_model(
+    pool: str,
+    slots: list[str],
+    bench: int,
+    price: float,
+    *,
+    effort: str | None = None,
+    dispatchable: bool = True,
+) -> dict[str, Any]:
+    model: dict[str, Any] = {
+        "pool": pool,
+        "slots": slots,
+        "bench": bench,
+        "price": {
+            "input": price,
+            "output": price,
+            "as_of": "2026-09-26",
+            "source": "https://example.test/pricing",
+        },
+    }
+    if effort is not None:
+        model["effort"] = effort
+    if not dispatchable:
+        model["dispatchable"] = False
+    return model
+
+
+def _build_synthetic_policy(tmp_path: Path) -> tuple[Policy, Catalog]:
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir()
+    shutil.copy(POLICY_DIR / "tiers.yaml", policy_dir / "tiers.yaml")
+    shutil.copy(POLICY_DIR / "roles.yaml", policy_dir / "roles.yaml")
+
+    catalog_dir = tmp_path / "catalog"
+    catalog_dir.mkdir()
+    models_document = {
+        "schema_version": 2,
+        "catalog_version": "test-catalog.1",
+        "pools": {
+            "claude": {
+                "provider": "claude",
+                "display_name": "Test Claude",
+                "slots": {"5h": "5h", "1w": "1w", "1w-fable": "1w-fable"},
+            },
+            "codex": {
+                "provider": "codex",
+                "display_name": "Test Codex",
+                "slots": {"5h": "5h", "1w": "1w"},
+            },
+            "grok": {
+                "provider": "supergrok",
+                "display_name": "Test Grok",
+                "slots": {"1w": "weekly"},
+            },
+            "agy": {
+                "provider": "antigravity",
+                "display_name": "Test Agy",
+                "slots": {"5h": "5h", "1w": "1w"},
+            },
+            "agy-3p": {
+                "provider": "antigravity",
+                "display_name": "Test Agy Third Party",
+                "slots": {"5h": "3p-5h", "1w": "3p-1w"},
+            },
+        },
+        "models": {
+            "model-agy-low": _catalog_model("agy", ["5h", "1w"], 55, 1.0),
+            "model-agy-high": _catalog_model(
+                "agy", ["5h", "1w"], 81, 1.0, effort="medium"
+            ),
+            "model-agy-planner": _catalog_model(
+                "agy", ["5h", "1w"], 99, 1.0, dispatchable=False
+            ),
+            "model-codex-low": _catalog_model("codex", ["5h", "1w"], 50, 2.0),
+            "model-codex-mid": _catalog_model(
+                "codex", ["5h", "1w"], 82, 2.0, effort="high"
+            ),
+            "model-codex-top": _catalog_model(
+                "codex", ["5h", "1w"], 90, 4.0, effort="max"
+            ),
+            "model-grok-mid": _catalog_model("grok", ["1w"], 77, 2.0),
+            "model-grok-top": _catalog_model(
+                "grok", ["1w"], 86, 2.0, effort="high"
+            ),
+            "model-claude-low": _catalog_model(
+                "claude", ["5h", "1w"], 60, 1.0
+            ),
+            "model-claude-mid": _catalog_model(
+                "claude", ["5h", "1w"], 80, 2.0
+            ),
+            "model-claude-top": _catalog_model(
+                "claude", ["5h", "1w"], 92, 5.0
+            ),
+            "model-claude-planner": _catalog_model(
+                "claude",
+                ["5h", "1w", "1w-fable"],
+                95,
+                10.0,
+                effort="max",
+                dispatchable=False,
+            ),
+        },
+    }
+    tiering_document = {
+        "schema_version": 1,
+        "blend": {"input": 1, "output": 3},
+        "tiers": {
+            "T0": {"min_bench": 0, "max_blended_price": 5},
+            "T1": {"min_bench": 60, "max_blended_price": 10},
+            "T2": {"min_bench": 74, "max_blended_price": 25},
+            "T3": {"min_bench": 86, "max_blended_price": None},
+        },
+        "orchestrator_excluded_vendors": ["agy"],
+    }
+    (catalog_dir / "models.yaml").write_text(
+        yaml.safe_dump(models_document, sort_keys=False),
+        encoding="utf-8",
+    )
+    (catalog_dir / "tiering.yaml").write_text(
+        yaml.safe_dump(tiering_document, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    catalog = load_catalog(catalog_dir)
+    return load_policy(policy_dir, catalog_dir=catalog_dir), catalog
+
+
 @pytest.fixture
-def policy() -> Policy:
-    """Load the declarative routing policy documents."""
-    return load_policy(POLICY_DIR)
+def policy_catalog(tmp_path: Path) -> tuple[Policy, Catalog]:
+    return _build_synthetic_policy(tmp_path)
+
+
+@pytest.fixture
+def policy(policy_catalog: tuple[Policy, Catalog]) -> Policy:
+    return policy_catalog[0]
 
 
 def _default_signals(
     overrides: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Generate baseline healthy signals for all five quota pools."""
     pools = {
-        "claude": {
+        pool: {
             "usable": True,
-            "score": 90.0,
+            "score": score,
             "level": "ok",
             "cooling": False,
             "seconds_until_reset": 7200,
             "stale": False,
-        },
-        "codex": {
-            "usable": True,
-            "score": 85.0,
-            "level": "ok",
-            "cooling": False,
-            "seconds_until_reset": 7200,
-            "stale": False,
-        },
-        "grok": {
-            "usable": True,
-            "score": 80.0,
-            "level": "ok",
-            "cooling": False,
-            "seconds_until_reset": 7200,
-            "stale": False,
-        },
-        "agy": {
-            "usable": True,
-            "score": 75.0,
-            "level": "ok",
-            "cooling": False,
-            "seconds_until_reset": 7200,
-            "stale": False,
-        },
-        "agy-3p": {
-            "usable": True,
-            "score": 70.0,
-            "level": "ok",
-            "cooling": False,
-            "seconds_until_reset": 7200,
-            "stale": False,
-        },
+        }
+        for pool, score in {
+            "claude": 90.0,
+            "codex": 85.0,
+            "grok": 80.0,
+            "agy": 75.0,
+            "agy-3p": 70.0,
+        }.items()
     }
     if overrides:
-        for pool, vals in overrides.items():
+        for pool, values in overrides.items():
             if pool in pools:
-                pools[pool].update(vals)
+                pools[pool].update(values)
             else:
-                pools[pool] = vals
+                pools[pool] = values
     return pools
 
 
 def test_tier_selection_highest_score(policy: Policy) -> None:
-    """a. When all pools are healthy with distinct scores, T0-T3 pick the highest-score candidate."""
-    # agy has highest score (95.0), but agy models reach only up to max_tier=2.
-    # grok (90.0) covers up to max_tier=3.
     signals = _default_signals(
         {
             "agy": {"score": 95.0},
@@ -119,89 +218,83 @@ def test_tier_selection_highest_score(policy: Policy) -> None:
         }
     )
 
-    # T0, T1, T2 have agy models available: gemini-3.8-flash-high (bench 81)
     for tier in ("T0", "T1", "T2"):
         rec = recommend(policy, signals, tier=tier, role="implement")
         assert rec.recommended is not None
-        assert rec.recommended["model"] == "gemini-3.8-flash-high"
+        assert rec.recommended["model"] == "model-agy-high"
         assert rec.recommended["vendor"] == "agy"
         assert "tier_capable" in rec.reason_codes
         assert "quota_healthy" in rec.reason_codes
         assert "provider_healthy" in rec.reason_codes
 
-    # T3 cannot use agy (max_tier=2), so it selects the highest among T3: grok-4.6 (score 90.0)
     rec_t3 = recommend(policy, signals, tier="T3", role="implement")
     assert rec_t3.recommended is not None
-    assert rec_t3.recommended["model"] == "grok-4.6"
+    assert rec_t3.recommended["model"] == "model-grok-top"
     assert rec_t3.recommended["vendor"] == "grok"
 
 
 def test_bench_breaks_score_tie(policy: Policy) -> None:
-    """b. When scores are identical, the model with higher benchmark capability is selected."""
-    # Claude and Codex both have score 90.0; grok and agy have lower score.
     signals = _default_signals(
         {
             "claude": {"score": 90.0},
             "codex": {"score": 90.0},
             "grok": {"score": 50.0},
             "agy": {"score": 50.0},
-            "agy-3p": {"score": 50.0},
         }
     )
 
-    # In T3: claude-opus-5 (bench 92, cost_rank 14) vs gpt-5.6-sol (bench 90, cost_rank 13).
-    # Despite higher cost_rank, claude-opus-5 wins due to superior bench.
     rec = recommend(policy, signals, tier="T3", role="implement")
     assert rec.recommended is not None
-    assert rec.recommended["model"] == "claude-opus-5"
+    assert rec.recommended["model"] == "model-claude-top"
     assert rec.recommended["vendor"] == "claude"
 
 
-def test_cost_rank_breaks_bench_and_score_tie(policy: Policy) -> None:
-    """c. When score and bench are identical, the model with lower cost_rank is selected."""
-    # Create two synthetic models with identical bench and pool, differing only in cost_rank.
+def test_blended_price_breaks_bench_and_score_tie(policy: Policy) -> None:
     synthetic_models = dict(policy.models)
     synthetic_models["model-cheap"] = Model(
         pool="claude",
         slots=["5h", "1w"],
-        max_tier=2,
         bench=99,
-        cost_rank=3,
+        blended_price=3.0,
+        effort="medium",
+        min_tier=0,
+        max_tier=2,
+        tiers=["T0", "T1", "T2"],
         role="subagent",
         reviewer=False,
+        orchestrator=False,
         dispatchable=True,
     )
     synthetic_models["model-expensive"] = Model(
         pool="claude",
         slots=["5h", "1w"],
-        max_tier=2,
         bench=99,
-        cost_rank=7,
+        blended_price=7.0,
+        effort="high",
+        min_tier=0,
+        max_tier=2,
+        tiers=["T0", "T1", "T2"],
         role="subagent",
         reviewer=False,
+        orchestrator=False,
         dispatchable=True,
     )
     custom_policy = policy.model_copy(update={"models": synthetic_models})
 
-    signals = _default_signals({"claude": {"score": 99.0}})
     rec = recommend(
         custom_policy,
-        signals,
+        _default_signals({"claude": {"score": 99.0}}),
         tier="T2",
         role="implement",
         available_vendors=["claude"],
     )
 
     assert rec.recommended is not None
-    # model-cheap has lower cost_rank (3 vs 7) and wins the tie-break
     assert rec.recommended["model"] == "model-cheap"
-    alt_models = [a["model"] for a in rec.alternatives]
-    assert "model-expensive" in alt_models
+    assert "model-expensive" in [alternative["model"] for alternative in rec.alternatives]
 
 
 def test_cross_vendor_review_exclusion(policy: Policy) -> None:
-    """d. Review role excludes the implementing vendor and emits cross_vendor_review reason."""
-    # Codex has highest score (99.0). Its reviewer is gpt-5.6-sol.
     signals = _default_signals(
         {
             "codex": {"score": 99.0},
@@ -209,7 +302,6 @@ def test_cross_vendor_review_exclusion(policy: Policy) -> None:
             "grok": {"score": 80.0},
         }
     )
-
     rec = recommend(
         policy,
         signals,
@@ -225,7 +317,6 @@ def test_cross_vendor_review_exclusion(policy: Policy) -> None:
 
 
 def test_no_eligible_candidate_and_wait_seconds(policy: Policy) -> None:
-    """e. When no candidate is eligible, recommended is None and wait_seconds is the minimum wait."""
     signals = {
         "claude": {
             "usable": False,
@@ -259,14 +350,6 @@ def test_no_eligible_candidate_and_wait_seconds(policy: Policy) -> None:
             "seconds_until_reset": 5400,
             "stale": False,
         },
-        "agy-3p": {
-            "usable": False,
-            "score": None,
-            "level": "unknown",
-            "cooling": False,
-            "seconds_until_reset": None,
-            "stale": False,
-        },
     }
 
     rec = recommend(policy, signals, tier="T2", role="implement")
@@ -274,32 +357,46 @@ def test_no_eligible_candidate_and_wait_seconds(policy: Policy) -> None:
     assert rec.alternatives == []
     assert "no_eligible_candidate" in rec.reason_codes
     assert "fallback_static" in rec.reason_codes
-    # Candidates for T2 include grok (1800), codex (3600), agy (5400), claude (7200).
-    # Minimum recovery wait duration is 1800 seconds.
     assert rec.wait_seconds == 1800
 
 
-def test_fable_dispatchable_implement_vs_orchestrate(policy: Policy) -> None:
-    """f. claude-fable-5-1 is excluded from implement tiers but eligible for orchestrate."""
+def test_planner_dispatchable_implement_vs_orchestrate(policy: Policy) -> None:
     signals = _default_signals({"claude": {"score": 100.0}})
 
-    # Implement tiers T0-T3 must never recommend or suggest claude-fable-5-1.
     for tier in ("T0", "T1", "T2", "T3"):
         rec = recommend(policy, signals, tier=tier, role="implement")
         assert rec.recommended is not None
-        assert rec.recommended["model"] != "claude-fable-5-1"
-        assert all(alt["model"] != "claude-fable-5-1" for alt in rec.alternatives)
+        assert rec.recommended["model"] != "model-claude-planner"
+        assert all(
+            alt["model"] != "model-claude-planner" for alt in rec.alternatives
+        )
 
-    # Orchestrate role admits claude-fable-5-1 as a candidate.
-    rec_orch = recommend(policy, signals, tier="T3", role="orchestrate")
-    assert rec_orch.recommended is not None
-    assert rec_orch.recommended["model"] == "claude-fable-5-1"
-    assert rec_orch.recommended["vendor"] == "claude"
+    rec_orchestrate = recommend(
+        policy,
+        signals,
+        tier="T3",
+        role="orchestrate",
+    )
+    assert rec_orchestrate.recommended is not None
+    assert rec_orchestrate.recommended["model"] == "model-claude-planner"
+    assert rec_orchestrate.recommended["vendor"] == "claude"
+
+
+def test_orchestrate_uses_derived_orchestrator_flag(policy: Policy) -> None:
+    signals = _default_signals({"agy": {"score": 100.0}})
+    rec = recommend(policy, signals, tier="T3", role="orchestrate")
+
+    returned = [rec.recommended, *rec.alternatives]
+    targets = [target for target in returned if target is not None]
+    assert targets
+    assert all(policy.models[str(target["model"])].orchestrator for target in targets)
+    assert all(target["vendor"] != "agy" for target in targets)
+    assert "model-agy-planner" not in {
+        target["model"] for target in targets
+    }
 
 
 def test_available_vendors_filtering(policy: Policy) -> None:
-    """g. Restricting available_vendors filters out non-whitelisted vendors and adds reason code."""
-    # agy and grok have the highest score, but caller allows only claude and codex.
     signals = _default_signals(
         {
             "agy": {"score": 100.0},
@@ -308,7 +405,6 @@ def test_available_vendors_filtering(policy: Policy) -> None:
             "codex": {"score": 75.0},
         }
     )
-
     rec = recommend(
         policy,
         signals,
@@ -319,17 +415,40 @@ def test_available_vendors_filtering(policy: Policy) -> None:
 
     assert rec.recommended is not None
     assert rec.recommended["vendor"] in {"claude", "codex"}
-    assert rec.recommended["vendor"] not in {"agy", "grok"}
-    for alt in rec.alternatives:
-        assert alt["vendor"] in {"claude", "codex"}
-        assert alt["vendor"] not in {"agy", "grok"}
+    assert all(alt["vendor"] in {"claude", "codex"} for alt in rec.alternatives)
     assert "vendor_filtered" in rec.reason_codes
+
+
+def test_model_usability_skips_otherwise_recommended_model(policy: Policy) -> None:
+    signals = _default_signals(
+        {
+            "codex": {"score": 99.0},
+            "claude": {"score": 85.0},
+            "grok": {"score": 80.0},
+        }
+    )
+    normal = recommend(policy, signals, tier="T3", role="implement")
+    filtered = recommend(
+        policy,
+        signals,
+        tier="T3",
+        role="implement",
+        model_usable={"model-codex-top": False},
+    )
+
+    assert normal.recommended is not None
+    assert normal.recommended["model"] == "model-codex-top"
+    assert filtered.recommended is not None
+    assert filtered.recommended["model"] == "model-claude-top"
+    assert all(
+        alternative["model"] != "model-codex-top"
+        for alternative in filtered.alternatives
+    )
 
 
 def _project_pools_to_signals(
     pools_out: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
-    """Project the legacy routing view pool dictionary to sanitized engine signals."""
     signals: dict[str, dict[str, Any]] = {}
     for pool_id, pool_data in pools_out.items():
         binding_slot = pool_data.get("binding_slot")
@@ -338,21 +457,24 @@ def _project_pools_to_signals(
             if binding_slot
             else None
         )
-        sur = window.get("seconds_until_reset") if window else None
-        cooling = pool_data.get("cooldown", {}).get("cooling", False)
         signals[pool_id] = {
             "usable": pool_data["usable"],
             "score": pool_data["score"],
             "level": pool_data["level"],
-            "cooling": cooling,
-            "seconds_until_reset": sur,
+            "cooling": pool_data.get("cooldown", {}).get("cooling", False),
+            "seconds_until_reset": (
+                window.get("seconds_until_reset") if window else None
+            ),
             "stale": pool_data["stale"],
         }
     return signals
 
 
 def _win(
-    key: str, used: float, reset_in_s: int, limit: int | None = None
+    key: str,
+    used: float,
+    reset_in_s: int,
+    limit: int | None = None,
 ) -> UsageWindow:
     return UsageWindow(
         key=key,
@@ -365,23 +487,25 @@ def _win(
 
 
 def _snap(
-    pid: ProviderId,
+    provider: ProviderId,
     windows: list[UsageWindow],
     *,
     age_s: int = 60,
     status: SnapshotStatus = SnapshotStatus.OK,
 ) -> AccountSnapshot:
     return AccountSnapshot(
-        provider=pid,
-        display_name=pid.value,
+        provider=provider,
+        display_name=provider.value,
         status=status,
         windows=windows,
         fetched_at=NOW - timedelta(seconds=age_s),
     )
 
 
-def test_parity_with_routing_view(policy: Policy) -> None:
-    """h. Parity test asserting identical recommendations to build_routing_payload."""
+def test_parity_with_routing_view(
+    policy_catalog: tuple[Policy, Catalog],
+) -> None:
+    policy, catalog = policy_catalog
     snapshots = [
         _snap(
             ProviderId.CODEX,
@@ -410,26 +534,18 @@ def test_parity_with_routing_view(policy: Policy) -> None:
         ),
     ]
 
-    payload = build_routing_payload(snapshots, now=NOW)
+    payload = build_routing_payload(snapshots, now=NOW, catalog=catalog)
     signals = _project_pools_to_signals(payload["pools"])
 
-    # Parity check for implementation tiers T0-T3.
     for tier in ("T0", "T1", "T2", "T3"):
         rec = recommend(policy, signals, tier=tier, role="implement")
-        legacy_rec = payload["tiers"][tier]["recommended"]
         assert rec.recommended is not None
-        assert rec.recommended["model"] == legacy_rec
+        assert rec.recommended["model"] == payload["tiers"][tier]["recommended"]
 
-    # Parity check for reviewer role.
     rec_review = recommend(policy, signals, tier="T2", role="review")
-    legacy_review_rec = payload["tiers"]["review"]["recommended"]
     assert rec_review.recommended is not None
-    assert rec_review.recommended["model"] == legacy_review_rec
+    assert rec_review.recommended["model"] == payload["tiers"]["review"]["recommended"]
 
-    # Intentional divergence check when no candidates are eligible:
-    # Legacy routing_view falls back to ranked[0] when eligible candidates is 0,
-    # whereas engine.recommend intentionally returns recommended=None so caller
-    # static ladder fallbacks can take over cleanly.
     error_snapshots = [
         _snap(
             ProviderId.CODEX,
@@ -452,21 +568,21 @@ def test_parity_with_routing_view(policy: Policy) -> None:
             status=SnapshotStatus.ERROR,
         ),
     ]
-    error_payload = build_routing_payload(error_snapshots, now=NOW)
+    error_payload = build_routing_payload(
+        error_snapshots,
+        now=NOW,
+        catalog=catalog,
+    )
     error_signals = _project_pools_to_signals(error_payload["pools"])
 
-    rec_err = recommend(policy, error_signals, tier="T2", role="implement")
-    # Legacy routing_view returned an unusable model fallback:
+    rec_error = recommend(policy, error_signals, tier="T2", role="implement")
     assert error_payload["tiers"]["T2"]["recommended"] is not None
-    # Engine intentionally returns None:
-    assert rec_err.recommended is None
-    assert "no_eligible_candidate" in rec_err.reason_codes
-    assert "fallback_static" in rec_err.reason_codes
+    assert rec_error.recommended is None
+    assert "no_eligible_candidate" in rec_error.reason_codes
+    assert "fallback_static" in rec_error.reason_codes
 
 
 def test_missing_pool_handling(policy: Policy) -> None:
-    """Missing pools default to unusable and unknown level without raising errors."""
-    # Provide only codex signal; claude, grok, agy are completely omitted
     signals = {
         "codex": {
             "usable": True,
@@ -479,31 +595,33 @@ def test_missing_pool_handling(policy: Policy) -> None:
     }
     rec = recommend(policy, signals, tier="T3", role="implement")
     assert rec.recommended is not None
-    # Only codex is usable, so gpt-5.6-sol should be recommended
-    assert rec.recommended["model"] == "gpt-5.6-sol"
+    assert rec.recommended["model"] == "model-codex-top"
     assert rec.recommended["vendor"] == "codex"
 
 
 def test_stale_signals_reason_code(policy: Policy) -> None:
-    """Stale signals on the recommended model add stale_signals to reason codes."""
     signals = _default_signals({"claude": {"score": 99.0, "stale": True}})
     rec = recommend(policy, signals, tier="T3", role="implement")
     assert rec.recommended is not None
-    assert rec.recommended["model"] == "claude-opus-5"
+    assert rec.recommended["model"] == "model-claude-top"
     assert "stale_signals" in rec.reason_codes
 
 
 def test_signals_stale_flag_adds_stale_signals_reason_code(policy: Policy) -> None:
-    """signals_stale parameter causes stale_signals reason code to be included."""
     signals = _default_signals({"claude": {"score": 99.0, "stale": False}})
-    rec = recommend(policy, signals, tier="T3", role="implement", signals_stale=True)
+    rec = recommend(
+        policy,
+        signals,
+        tier="T3",
+        role="implement",
+        signals_stale=True,
+    )
     assert rec.recommended is not None
-    assert rec.recommended["model"] == "claude-opus-5"
+    assert rec.recommended["model"] == "model-claude-top"
     assert "stale_signals" in rec.reason_codes
 
 
 def test_reason_codes_strict_order(policy: Policy) -> None:
-    """Reason codes must follow the fixed specification order without duplicates."""
     signals = _default_signals({"claude": {"score": 99.0, "stale": True}})
     rec = recommend(
         policy,
@@ -519,11 +637,11 @@ def test_reason_codes_strict_order(policy: Policy) -> None:
     assert len(rec.reason_codes) == len(set(rec.reason_codes))
 
 
-def test_response_minimal_surface(policy: Policy) -> None:
-    """Recommendation strictly exposes only public vendor/model pairs and no sensitive internals."""
-    signals = _default_signals()
-    rec = recommend(policy, signals, tier="T2", role="implement")
+def test_response_includes_effort_with_minimal_surface(policy: Policy) -> None:
+    rec = recommend(policy, _default_signals(), tier="T2", role="implement")
     assert rec.recommended is not None
-    assert set(rec.recommended.keys()) == {"vendor", "model"}
-    for alt in rec.alternatives:
-        assert set(alt.keys()) == {"vendor", "model"}
+    assert set(rec.recommended) == {"vendor", "model", "effort"}
+    assert "effort" in rec.recommended
+    for alternative in rec.alternatives:
+        assert set(alternative) == {"vendor", "model", "effort"}
+        assert "effort" in alternative

@@ -84,7 +84,9 @@ services:
       start_period: 15s
 
   routing-policy:
-    build: ./routing-policy
+    build:
+      context: .
+      dockerfile: routing-policy/Dockerfile
     image: routing-policy:local
     container_name: routing-policy
     ports:

@@ -7,6 +7,4 @@ policy:
 # with legacy routing_view. Modifying this list does not alter engine sorting;
 # changing the ranking sequence requires updating engine.py.
 ranking: [availability, quota, capability, cost]
-orchestrator:
-  # agy may only supply gemini-* subagents and must never orchestrate.
-  excluded_vendors: [agy]
+# Orchestrator vendor exclusions live in catalog/tiering.yaml (orchestrator_excluded_vendors).
