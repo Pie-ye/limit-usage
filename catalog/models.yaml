@@ -1,0 +1,137 @@
+# Model catalog — the single source of truth for which models exist, how strong
+# they are (bench) and what they cost (API list price). Tiers are NOT stored here:
+# catalog/tiering.py derives each model's [min_tier, max_tier] from bench and price
+# using catalog/tiering.yaml. Update bench / price here; never hand-set a tier.
+schema_version: 2
+catalog_version: "2026-09-26.1"
+pools:
+  claude:
+    provider: claude
+    display_name: "Claude Code (claude)"
+    slots: {"5h": "5h", "1w": "1w", "1w-fable": "1w-fable"}
+  codex:
+    provider: codex
+    display_name: "Codex (codex)"
+    slots: {"5h": "5h", "1w": "1w"}
+  grok:
+    provider: supergrok
+    display_name: "SuperGrok (grok)"
+    slots: {"1w": "weekly"}
+  agy:
+    provider: antigravity
+    display_name: "Antigravity · Gemini (agy)"
+    slots: {"5h": "5h", "1w": "1w"}
+  agy-3p:
+    provider: antigravity
+    display_name: "Antigravity · Claude/GPT (agy)"
+    slots: {"5h": "3p-5h", "1w": "3p-1w"}
+models:
+  # --- agy (Antigravity, gemini-* only) ---
+  gemini-3.8-flash-low:
+    pool: agy
+    slots: ["5h", "1w"]
+    bench: 55
+    bench_note: "最低推理檔"
+    price: {input: 0.75, output: 3.75, as_of: "2026-09-26", source: "https://ai.google.dev/gemini-api/docs/pricing"}
+  gemini-3.8-flash-medium:
+    pool: agy
+    slots: ["5h", "1w"]
+    bench: 70
+    bench_note: "同 flash-high 但推理降檔"
+    price: {input: 0.75, output: 3.75, as_of: "2026-09-26", source: "https://ai.google.dev/gemini-api/docs/pricing"}
+  gemini-3.8-flash-high:
+    pool: agy
+    slots: ["5h", "1w"]
+    bench: 81
+    bench_note: "SWE-Pro 61.6；TB 2.1 90.8（全場最高）；聚合榜勝 3.1 Pro"
+    price: {input: 0.75, output: 3.75, as_of: "2026-09-26", source: "https://ai.google.dev/gemini-api/docs/pricing"}
+  gemini-3.1-pro-low:
+    pool: agy
+    slots: ["5h", "1w"]
+    bench: 65
+    bench_note: "同 pro-high 但推理降檔"
+    price: {input: 2.0, output: 12.0, as_of: "2026-09-26", source: "https://ai.google.dev/gemini-api/docs/pricing"}
+  gemini-3.1-pro-high:
+    pool: agy
+    slots: ["5h", "1w"]
+    bench: 74
+    bench_note: "SWE-bench Verified 80.6（2026-02，舊 harness）；TB 2.0 68.5"
+    price: {input: 2.0, output: 12.0, as_of: "2026-09-26", source: "https://ai.google.dev/gemini-api/docs/pricing"}
+  # --- codex ---
+  gpt-reserve:
+    pool: codex
+    slots: ["5h", "1w"]
+    bench: 50
+    bench_note: "無公開 benchmark，codex 標為「fast and affordable」"
+    price: {input: 0.2, output: 1.2, as_of: "2026-09-26", source: "https://help.openai.com/en/articles/20001499-luna-reserve-in-codex-and-chatgpt-work", proxy_of: gpt-5.6-luna}
+  gpt-5.6-luna:
+    pool: codex
+    slots: ["5h", "1w"]
+    bench: 78
+    bench_note: "GPT-5.6 最便宜檔；TB 2.1 84.7；AA Coding Agent 74.6（> Opus 4.8）"
+    price: {input: 0.2, output: 1.2, as_of: "2026-09-26", source: "https://developers.openai.com/api/docs/pricing"}
+    effort: max
+  gpt-5.5:
+    pool: codex
+    slots: ["5h", "1w"]
+    bench: 72
+    bench_note: "上一代；SWE-Pro 59.4；TB 2.1 85.6"
+    price: {input: 5.0, output: 30.0, as_of: "2026-09-26", source: "https://developers.openai.com/api/docs/pricing"}
+  gpt-5.6-terra:
+    pool: codex
+    slots: ["5h", "1w"]
+    bench: 82
+    bench_note: "SWE-Pro 63.4；TB 2.1 87.4"
+    price: {input: 2.0, output: 12.0, as_of: "2026-09-26", source: "https://developers.openai.com/api/docs/pricing"}
+    effort: high
+  gpt-5.6-sol:
+    pool: codex
+    slots: ["5h", "1w"]
+    bench: 90
+    bench_note: "SWE-Pro 64.6；TB 2.1 88.8；AA Coding Agent 80（#1）"
+    # Promotional price, at least through 2026-11-21; list price is 5 / 30.
+    price: {input: 4.0, output: 20.0, as_of: "2026-09-26", source: "https://developers.openai.com/api/docs/pricing"}
+    effort: max
+  # --- grok ---
+  grok-4.5:
+    pool: grok
+    slots: ["1w"]
+    bench: 77
+    bench_note: "SWE-Pro 64.7；TB 2.1 83.3"
+    price: {input: 2.0, output: 6.0, as_of: "2026-09-26", source: "https://docs.x.ai/docs/models/grok-4.5"}
+    effort: medium
+  grok-4.6:
+    pool: grok
+    slots: ["1w"]
+    bench: 86
+    bench_note: "AA Intelligence 61（與 Sol 同）；TB 2.1 88.4；APEX-SWE 56.4；純 SWE 評測輸 Sol 7–8 分"
+    price: {input: 2.0, output: 6.0, as_of: "2026-09-26", source: "https://docs.x.ai/docs/models/grok-4.6"}
+    effort: high
+  # --- claude ---
+  claude-haiku-4-5-20251001:
+    pool: claude
+    slots: ["5h", "1w"]
+    bench: 60
+    bench_note: "2025 小模型，無 SWE-Pro 數據"
+    price: {input: 1.0, output: 5.0, as_of: "2026-09-26", source: "https://platform.claude.com/docs/en/about-claude/pricing"}
+  claude-sonnet-5:
+    pool: claude
+    slots: ["5h", "1w"]
+    bench: 80
+    bench_note: "SWE-Pro 63.2；TB 2.1 80.4"
+    price: {input: 2.0, output: 10.0, as_of: "2026-09-26", source: "https://platform.claude.com/docs/en/about-claude/pricing"}
+  claude-opus-5:
+    pool: claude
+    slots: ["5h", "1w"]
+    bench: 92
+    bench_note: "未公布 SWE-Pro；TB 2.1 89.1、TB 4.0 52.3（僅次 Fable 5.1）；AA Intelligence 63（#1）"
+    price: {input: 5.0, output: 25.0, as_of: "2026-09-26", source: "https://platform.claude.com/docs/en/about-claude/pricing"}
+  # Orchestrator-only: reported for its Fable weekly cap, never dispatched
+  # (it would burn the planner's own cap).
+  claude-fable-5-1:
+    pool: claude
+    slots: ["5h", "1w", "1w-fable"]
+    bench: 95
+    bench_note: "SWE-Pro 81.2；TB 4.0 55.8（全場最高）"
+    price: {input: 10.0, output: 50.0, as_of: "2026-09-26", source: "https://platform.claude.com/docs/en/about-claude/pricing"}
+    dispatchable: false
