@@ -50,7 +50,7 @@ ladder.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from app.models import AccountSnapshot, ProviderId, UsageWindow, utcnow
 from app.services.analytics import (
@@ -59,6 +59,7 @@ from app.services.analytics import (
     compute_burn_estimate,
     extract_series_points,
 )
+from app.services.cli_models import CliModels
 from catalog.tiering import (
     Catalog,
     Derived,
@@ -237,6 +238,11 @@ def _cooldown_view(cooldowns: dict[str, dict[str, Any]], pool_id: str) -> dict[s
 
 def _wait_seconds(row: dict[str, Any]) -> int | None:
     """Seconds until a non-eligible model row could become usable again."""
+    if row.get("listed") is False:
+        return None
+    missing = row.get("missing")
+    if missing and isinstance(missing, dict):
+        return int(missing.get("seconds_left") or 0)
     cd = row.get("cooldown") or {}
     if cd.get("cooling"):
         return int(cd.get("seconds_left") or 0)
@@ -252,6 +258,8 @@ def build_routing_payload(
     now: datetime | None = None,
     stale_after_seconds: int = DEFAULT_STALE_AFTER_SECONDS,
     cooldowns: dict[str, dict[str, Any]] | None = None,
+    missing_models: Mapping[str, Mapping[str, Any]] | None = None,
+    cli_models: CliModels | None = None,
     avoid_vendor: str | None = None,
     vendors: Iterable[str] | None = None,
     min_score: float | None = None,
@@ -330,6 +338,15 @@ def build_routing_payload(
             continue
         scored = _score(pool["windows"], list(d.slots))
         binding = pool["windows"].get(scored["binding_slot"]) if scored["binding_slot"] else None
+        listed = cli_models.listed(d.vendor, model_id) if cli_models else None
+        missing = (missing_models or {}).get(model_id)
+        usable = (
+            pool["status"] == "ok"
+            and scored["level"] not in {"critical", "unknown"}
+            and not pool["cooldown"]["cooling"]
+            and listed is not False
+            and missing is None
+        )
         models_out[model_id] = {
             "vendor": d.vendor,
             "pool": d.pool,
@@ -344,15 +361,11 @@ def build_routing_payload(
             "reviewer": d.reviewer,
             "orchestrator": d.orchestrator,
             "dispatchable": d.dispatchable,
-            "listed": None,
-            "missing": None,
+            "listed": listed,
+            "missing": missing,
             "status": pool["status"],
             "stale": pool["stale"],
-            "usable": (
-                pool["status"] == "ok"
-                and scored["level"] not in {"critical", "unknown"}
-                and not pool["cooldown"]["cooling"]
-            ),
+            "usable": usable,
             "cooldown": pool["cooldown"],
             "remaining_percent": binding["remaining_percent"] if binding else None,
             "seconds_until_reset": binding["seconds_until_reset"] if binding else None,
@@ -462,8 +475,8 @@ def build_routing_payload(
             "catalog_version": active_catalog.catalog_version,
             "blend": dict(active_catalog.blend),
             "thresholds": {t: dict(v) for t, v in active_catalog.thresholds.items()},
-            "uncatalogued": {},
-            "cli_models": None,
+            "uncatalogued": cli_models.uncatalogued(active_catalog.models.keys()) if cli_models else {},
+            "cli_models": cli_models.summary() if cli_models else None,
         },
         "pools": pools_out,
         "models": models_out,

@@ -13,6 +13,7 @@ from app.services.routing_feedback import (
     COOLDOWN_SHORT,
     COOLDOWN_TRANSIENT,
     MAX_COOLDOWN_SECONDS,
+    MODEL_MISSING_SECONDS,
     FeedbackRegistry,
     backoff_seconds,
     classify,
@@ -242,3 +243,125 @@ def test_feedback_endpoint_round_trip(fake_catalog, monkeypatch):
         assert c.post("/api/routing/feedback", json={"pool": "grok", "status": 429}).json()["pool"] == "grok"
         assert c.delete("/api/routing/feedback?pool=grok").json()["cleared"] == "grok"
         assert "grok" not in c.get("/api/routing/feedback").json()["pools"]
+        assert "models" in c.get("/api/routing/feedback").json()
+
+
+def test_registry_model_missing_404(fake_catalog):
+    reg = FeedbackRegistry()
+    t0 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    res = reg.report("codex", ok=False, status=404, model="model-codex-mid", error="not found", now=t0)
+    assert res["kind"] == "model_missing"
+    assert res["cooldown_seconds"] == MODEL_MISSING_SECONDS
+    assert res["cooling"] is False
+    assert res["model"] == "model-codex-mid"
+    assert res["pool"] == "codex"
+
+    # Pool is NOT cooling
+    assert reg.active(now=t0) == {}
+
+    # missing_models contains model-codex-mid
+    missing = reg.missing_models(now=t0)
+    assert "model-codex-mid" in missing
+    assert missing["model-codex-mid"]["missing"] is True
+    assert missing["model-codex-mid"]["seconds_left"] == MODEL_MISSING_SECONDS
+    assert missing["model-codex-mid"]["last_error"] == "not found"
+
+    # Payload integration: model-codex-mid is unusable and missing, other codex models remain usable
+    out = build_routing_payload(
+        _all_ok(),
+        now=t0,
+        cooldowns=reg.active(now=t0),
+        missing_models=reg.missing_models(now=t0),
+        catalog=fake_catalog,
+    )
+    mid = out["models"]["model-codex-mid"]
+    assert mid["missing"] is not None
+    assert mid["usable"] is False
+    top = out["models"]["model-codex-top"]
+    assert top["missing"] is None
+    assert top["usable"] is True
+    assert out["pools"]["codex"]["cooldown"]["cooling"] is False
+
+    # Snapshot includes models block
+    snap = reg.snapshot(now=t0)
+    assert "model-codex-mid" in snap["models"]
+    assert snap["models"]["model-codex-mid"]["missing"] is True
+
+    # Success with same model clears missing state
+    t1 = t0 + timedelta(minutes=5)
+    ok_res = reg.report("codex", ok=True, model="model-codex-mid", now=t1)
+    assert ok_res["cooling"] is False
+    assert reg.missing_models(now=t1) == {}
+    snap_after = reg.snapshot(now=t1)
+    assert snap_after["models"] == {}
+
+
+def test_registry_model_missing_expires_after_24h():
+    reg = FeedbackRegistry()
+    t0 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    reg.report("codex", ok=False, status=404, model="model-codex-mid", now=t0)
+
+    # After 23 hours: still missing
+    t_23h = t0 + timedelta(hours=23)
+    assert "model-codex-mid" in reg.missing_models(now=t_23h)
+
+    # After 24h + 1s: expired and pruned
+    t_24h = t0 + timedelta(hours=24, seconds=1)
+    assert reg.missing_models(now=t_24h) == {}
+    assert reg.snapshot(now=t_24h)["models"] == {}
+
+
+def test_registry_404_without_model_cools_pool():
+    reg = FeedbackRegistry()
+    t0 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    res = reg.report("codex", ok=False, status=404, now=t0)
+    assert res["kind"] == "rejected"
+    assert res["cooldown_seconds"] == COOLDOWN_LONG
+    assert res["cooling"] is True
+    assert "codex" in reg.active(now=t0)
+    assert reg.missing_models(now=t0) == {}
+
+
+def test_feedback_endpoint_model_missing_round_trip(fake_catalog, monkeypatch):
+    monkeypatch.setattr("app.services.routing_view.CATALOG", fake_catalog)
+    with _client() as c:
+        # Initial feedback state has empty models
+        init_state = c.get("/api/routing/feedback").json()
+        assert init_state["models"] == {}
+
+        # Report 404 with model
+        r = c.post(
+            "/api/routing/feedback",
+            json={"model": "model-codex-mid", "ok": False, "status": 404, "error": "model not found"},
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["pool"] == "codex"
+        assert data["kind"] == "model_missing"
+        assert data["cooldown_seconds"] == MODEL_MISSING_SECONDS
+        assert data["cooling"] is False
+        assert data["model"] == "model-codex-mid"
+
+        # GET /api/routing/feedback includes models block with the model
+        fb_state = c.get("/api/routing/feedback").json()
+        assert "models" in fb_state
+        assert "model-codex-mid" in fb_state["models"]
+        assert fb_state["models"]["model-codex-mid"]["missing"] is True
+        assert fb_state["pools"]["codex"]["cooling"] is False
+
+        # GET /api/routing?model=model-codex-mid has usable: false
+        row_mid = c.get("/api/routing?model=model-codex-mid").json()
+        assert row_mid["usable"] is False
+        assert row_mid["missing"] is not None
+
+        # Same pool other model is still usable
+        row_top = c.get("/api/routing?model=model-codex-top").json()
+        assert row_top["usable"] is True
+        assert row_top["missing"] is None
+
+        # Success clears the model missing state
+        r_ok = c.post("/api/routing/feedback", json={"model": "model-codex-mid", "ok": True})
+        assert r_ok.status_code == 200
+        assert c.get("/api/routing?model=model-codex-mid").json()["usable"] is True
+        assert c.get("/api/routing?model=model-codex-mid").json()["missing"] is None
+        assert "model-codex-mid" not in c.get("/api/routing/feedback").json()["models"]

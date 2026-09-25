@@ -218,22 +218,30 @@ def create_app() -> FastAPI:
         from datetime import timedelta
 
         from app.models import utcnow
+        from app.services.cli_models import load_cli_models
         from app.services.routing_view import LOOKBACK_HOURS, build_routing_payload
 
         repo: Repository = request.app.state.repository
         poller: UsagePoller = request.app.state.poller
         feedback: FeedbackRegistry = request.app.state.routing_feedback
+        now = utcnow()
         snaps = poller.get_snapshots()
-        since = utcnow() - timedelta(hours=max(LOOKBACK_HOURS.values()))
+        since = now - timedelta(hours=max(LOOKBACK_HOURS.values()))
         history_by: dict = {
             s.provider.value: repo.get_history(provider=s.provider.value, limit=20000, since=since)
             for s in snaps
         }
+        settings = get_settings()
+        cli_models = load_cli_models(settings.cli_models_path, now=now)
+        missing_models = feedback.missing_models(now=now)
         return build_routing_payload(
             snaps,
             history_by,
+            now=now,
             stale_after_seconds=stale_after,
-            cooldowns=feedback.active(),
+            cooldowns=feedback.active(now=now),
+            missing_models=missing_models,
+            cli_models=cli_models,
             avoid_vendor=avoid_vendor,
             vendors=vendors,
             min_score=min_score,
