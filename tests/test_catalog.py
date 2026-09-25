@@ -6,6 +6,12 @@ import yaml
 
 from catalog.tiering import Catalog, Derived, load_catalog, tier_candidates
 
+
+@pytest.fixture(autouse=True)
+def _clear_catalog_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CATALOG_DIR", raising=False)
+
+
 GOLDEN_DATA = [
     {
         "model": "gemini-3.8-flash-low",
@@ -484,6 +490,27 @@ def test_validation_proxy_of_unknown_model(tmp_path: Path) -> None:
     _write_catalog(tmp_path, bad_yaml)
     with pytest.raises(ValueError, match=r"models\.yaml: models\.model-a\.price\.proxy_of: unknown model 'nonexistent-model'"):
         load_catalog(tmp_path)
+
+
+def test_validation_proxy_of_price_mismatch(tmp_path: Path) -> None:
+    bad_yaml = BASE_MODELS_YAML.replace(
+        'source: "test-src"',
+        'source: "test-src", proxy_of: "model-b"',
+    ) + """\
+  model-b:
+    pool: test-pool
+    slots: ["5h"]
+    bench: 70
+    price: {input: 1.0, output: 3.0, as_of: "2026-09-26", source: "test-src"}
+"""
+    _write_catalog(tmp_path, bad_yaml)
+
+    with pytest.raises(ValueError) as error:
+        load_catalog(tmp_path)
+    assert str(error.value) == (
+        "models.yaml: models.model-a.price: must equal proxy_of model-b price "
+        "(expected input=1.0, output=3.0; got input=1.0, output=2.0)"
+    )
 
 
 def test_validation_as_of_format(tmp_path: Path) -> None:

@@ -46,21 +46,57 @@ def test_load_cli_models_normal_and_listed(tmp_path: Path):
 
 def test_load_cli_models_stale_over_48h(tmp_path: Path):
     path = tmp_path / "cli-models.json"
+    generated_at = datetime(2026, 9, 26, 8, 0, tzinfo=timezone.utc)
     payload = {
-        "generated_at": "2026-09-26T08:00:00Z",
+        "generated_at": generated_at.isoformat().replace("+00:00", "Z"),
         "vendors": {
             "codex": {"ok": True, "models": ["model-codex-top"]},
         },
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
-    # 49 hours after generated_at (> FRESH_MAX_AGE_SECONDS)
-    now = datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)
+    now = generated_at + timedelta(seconds=FRESH_MAX_AGE_SECONDS + 3600)
 
     cm = load_cli_models(path, now=now)
     assert cm is not None
     assert cm.vendors["codex"].fresh is False
     assert cm.listed("codex", "model-codex-top") is None
     assert cm.uncatalogued([]) == {}
+
+
+def test_load_cli_models_future_60_seconds_is_fresh(tmp_path: Path):
+    path = tmp_path / "future-60.json"
+    now = datetime(2026, 9, 26, 10, 0, tzinfo=timezone.utc)
+    payload = {
+        "generated_at": (now + timedelta(seconds=60)).isoformat().replace("+00:00", "Z"),
+        "vendors": {
+            "codex": {"ok": True, "models": ["model-codex-top"]},
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cm = load_cli_models(path, now=now)
+
+    assert cm is not None
+    assert cm.vendors["codex"].fresh is True
+    assert cm.listed("codex", "model-codex-top") is True
+
+
+def test_load_cli_models_future_600_seconds_is_not_fresh(tmp_path: Path):
+    path = tmp_path / "future-600.json"
+    now = datetime(2026, 9, 26, 10, 0, tzinfo=timezone.utc)
+    payload = {
+        "generated_at": (now + timedelta(seconds=600)).isoformat().replace("+00:00", "Z"),
+        "vendors": {
+            "codex": {"ok": True, "models": ["model-codex-top"]},
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cm = load_cli_models(path, now=now)
+
+    assert cm is not None
+    assert cm.vendors["codex"].fresh is False
+    assert cm.listed("codex", "model-codex-top") is None
 
 
 def test_load_cli_models_invalid_files(tmp_path: Path):
@@ -163,6 +199,8 @@ def test_mtime_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert cm3 is not None
     assert call_count == 2
     assert cm3.listed("codex", "model-updated") is True
+    assert cm_mod._CACHE is not None
+    assert cm_mod._CACHE[0] == (path.resolve(), path.stat().st_mtime_ns)
 
 
 def test_uncatalogued(tmp_path: Path):

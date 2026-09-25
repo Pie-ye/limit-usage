@@ -257,6 +257,14 @@ def _validate_models(data: dict[str, Any]) -> None:
             proxy_of = price["proxy_of"]
             if not isinstance(proxy_of, str) or proxy_of not in models or proxy_of == model_id:
                 raise ValueError(f"models.yaml: models.{model_id}.price.proxy_of: unknown model '{proxy_of}'")
+            proxy_price = models[proxy_of]["price"]
+            if price["input"] != proxy_price["input"] or price["output"] != proxy_price["output"]:
+                raise ValueError(
+                    f"models.yaml: models.{model_id}.price: must equal proxy_of "
+                    f"{proxy_of} price (expected input={proxy_price['input']}, "
+                    f"output={proxy_price['output']}; got input={price['input']}, "
+                    f"output={price['output']})"
+                )
 
 
 def load_catalog(directory: str | Path | None = None) -> Catalog:

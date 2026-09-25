@@ -18,7 +18,8 @@ POLICY_DIR = ROUTING_POLICY_ROOT / "policy"
 
 
 @pytest.fixture
-def policy() -> Policy:
+def policy(monkeypatch: pytest.MonkeyPatch) -> Policy:
+    monkeypatch.delenv("CATALOG_DIR", raising=False)
     return load_policy(POLICY_DIR)
 
 
@@ -101,6 +102,37 @@ def test_policy_metadata_and_real_catalog(policy: Policy) -> None:
         for tier in ("T0", "T1", "T2", "T3")
     )
     assert policy.models["claude-fable-5-1"].dispatchable is False
+
+
+def test_tier_candidates_rejects_unknown_tier(policy: Policy) -> None:
+    with pytest.raises(KeyError) as error:
+        policy.tier_candidates("T9")
+    assert error.value.args == ("T9",)
+
+
+def test_model_min_tier_conversion(
+    policy: Policy,
+    synthetic_policy_and_catalog: tuple[Path, Path],
+) -> None:
+    assert policy.models["gemini-3.1-pro-low"].min_tier == 1
+    assert policy.models["gpt-5.5"].min_tier == 2
+    assert policy.models["gpt-5.5"].tiers == []
+
+    policy_dir, catalog_dir = synthetic_policy_and_catalog
+
+    def cap_t3_price(document: dict[str, Any]) -> None:
+        document["tiers"]["T3"]["max_blended_price"] = 50
+
+    def exceed_all_price_caps(document: dict[str, Any]) -> None:
+        document["models"]["model-test"]["price"]["input"] = 51.0
+        document["models"]["model-test"]["price"]["output"] = 51.0
+
+    _change_document(catalog_dir, "tiering.yaml", cap_t3_price)
+    _change_document(catalog_dir, "models.yaml", exceed_all_price_caps)
+
+    no_minimum = load_policy(policy_dir, catalog_dir=catalog_dir)
+    assert no_minimum.models["model-test"].min_tier is None
+    assert no_minimum.models["model-test"].tiers == []
 
 
 def test_rejects_unknown_pool_reference(

@@ -98,14 +98,6 @@ flowchart LR
 | dispatch 回饋 | 每次派工後 | `POST /api/routing/feedback`；限流／429 → 60s、120s、240s…；401/402/403 → 5 分鐘；上限 30 分鐘 | 記憶體內冷卻 |
 | `limit-usage-cli-models.timer` | 每 6 小時（開機後 2 分鐘首次） | `deploy/cli-models-export.py` 匯出 codex（讀 `~/.codex/models_cache.json`）／agy（`agy models`）／grok（`grok models`）可用模型清單，原子寫出 | `data/cli-models.json` |
 
-安裝 CLI 模型清單匯出 timer：
-
-```bash
-cp deploy/limit-usage-cli-models.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now limit-usage-cli-models.timer
-```
-
 本機 `/api/ingest/claude` 目前 `host_count: 0`，尚無外部主機在推。無主動告警；警示只體現在儀表板紅字與 `level: low/critical`。
 
 ## 部署與執行
@@ -239,7 +231,7 @@ systemctl --user enable --now limit-usage-claude-monitor.timer
 systemctl --user restart limit-usage-claude-monitor.service   # 立刻拷一次
 
 # 3. cli models export timer
-cp deploy/limit-usage-cli-models.{service,timer} ~/.config/systemd/user/
+install -m644 deploy/limit-usage-cli-models.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now limit-usage-cli-models.timer
 ```

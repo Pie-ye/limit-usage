@@ -298,17 +298,20 @@ def test_registry_model_missing_404(fake_catalog):
 
 def test_registry_model_missing_expires_after_24h():
     reg = FeedbackRegistry()
+    snapshot_reg = FeedbackRegistry()
     t0 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
     reg.report("codex", ok=False, status=404, model="model-codex-mid", now=t0)
+    snapshot_reg.report("codex", ok=False, status=404, model="model-codex-mid", now=t0)
 
     # After 23 hours: still missing
     t_23h = t0 + timedelta(hours=23)
     assert "model-codex-mid" in reg.missing_models(now=t_23h)
+    assert "model-codex-mid" in snapshot_reg.snapshot(now=t_23h)["models"]
 
-    # After 24h + 1s: expired and pruned
+    # After 24h + 1s: both views independently prune expired state
     t_24h = t0 + timedelta(hours=24, seconds=1)
     assert reg.missing_models(now=t_24h) == {}
-    assert reg.snapshot(now=t_24h)["models"] == {}
+    assert snapshot_reg.snapshot(now=t_24h)["models"] == {}
 
 
 def test_registry_404_without_model_cools_pool():

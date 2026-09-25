@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 FRESH_MAX_AGE_SECONDS = 48 * 3600
+FUTURE_CLOCK_SKEW_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -86,7 +87,7 @@ class _RawCliModels:
     vendors: dict[str, _RawVendor]
 
 
-_CACHE: dict[tuple[Path, int], _RawCliModels] = {}
+_CACHE: tuple[tuple[Path, int], _RawCliModels] | None = None
 
 
 def _parse_iso(s: str) -> datetime | None:
@@ -100,6 +101,8 @@ def _parse_iso(s: str) -> datetime | None:
 
 
 def load_cli_models(path: str | Path, *, now: datetime) -> CliModels | None:
+    global _CACHE
+
     resolved_path = Path(path).expanduser().resolve()
     try:
         st = resolved_path.stat()
@@ -109,7 +112,7 @@ def load_cli_models(path: str | Path, *, now: datetime) -> CliModels | None:
     mtime_ns = st.st_mtime_ns
     cache_key = (resolved_path, mtime_ns)
 
-    raw = _CACHE.get(cache_key)
+    raw = _CACHE[1] if _CACHE is not None and _CACHE[0] == cache_key else None
     if raw is None:
         try:
             text = resolved_path.read_text(encoding="utf-8")
@@ -155,10 +158,12 @@ def load_cli_models(path: str | Path, *, now: datetime) -> CliModels | None:
                     vendors_raw[v_name] = _RawVendor(ok=False, models=frozenset(), error=err_str)
 
         raw = _RawCliModels(generated_at=gen_dt, vendors=vendors_raw)
-        _CACHE[cache_key] = raw
+        _CACHE = (cache_key, raw)
 
     now_utc = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
     age = (now_utc - raw.generated_at).total_seconds()
+    if -FUTURE_CLOCK_SKEW_SECONDS <= age < 0:
+        age = 0
     file_fresh = 0 <= age <= FRESH_MAX_AGE_SECONDS
 
     vendors_out: dict[str, VendorList] = {}

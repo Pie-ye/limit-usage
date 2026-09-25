@@ -186,6 +186,7 @@ class FeedbackRegistry:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         current = _as_utc(now or utcnow())
+        model_missing = not ok and status == 404 and bool(model)
         with self._lock:
             state = self._pools.setdefault(pool, PoolState())
             if ok:
@@ -199,7 +200,8 @@ class FeedbackRegistry:
                 state.last_model = model or state.last_model
                 state.successes += 1
                 decision = {"kind": "ok", "cooldown_seconds": 0, "backoff_level": 0}
-            elif status == 404 and model:
+            elif model_missing:
+                assert model is not None
                 m_state = self._models.setdefault(model, ModelState())
                 m_state.missing_until = current + timedelta(seconds=MODEL_MISSING_SECONDS)
                 m_state.last_error = (error or "")[:500] or None
@@ -244,9 +246,14 @@ class FeedbackRegistry:
             )
             del state.history[:-HISTORY_LIMIT]
             out = {"pool": pool, **state.view(current), **decision}
-            if status == 404 and not ok and model:
+            if model_missing:
                 out["model"] = model
             return out
+
+    def _prune_expired_models(self, now: datetime) -> None:
+        expired = [model for model, state in self._models.items() if not state.missing(now)]
+        for model in expired:
+            del self._models[model]
 
     def active(self, now: datetime | None = None) -> dict[str, dict[str, Any]]:
         """Pools currently cooling → their view. Expired entries are dropped."""
@@ -258,17 +265,13 @@ class FeedbackRegistry:
         """Currently missing models → their view. Expired entries are pruned."""
         current = _as_utc(now or utcnow())
         with self._lock:
-            expired = [m for m, s in self._models.items() if not s.missing(current)]
-            for m in expired:
-                del self._models[m]
+            self._prune_expired_models(current)
             return {m: s.view(current) for m, s in self._models.items()}
 
     def snapshot(self, now: datetime | None = None) -> dict[str, Any]:
         current = _as_utc(now or utcnow())
         with self._lock:
-            expired = [m for m, s in self._models.items() if not s.missing(current)]
-            for m in expired:
-                del self._models[m]
+            self._prune_expired_models(current)
             return {
                 "server_time": _iso(current),
                 "pools": {p: {**s.view(current), "history": list(s.history)} for p, s in self._pools.items()},

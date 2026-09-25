@@ -24,10 +24,11 @@ Scoring rule (deliberately simple so a shell caller can reason about it):
    thresholds are shared with ``app.services.analytics``.
 
 Tier recommendation: no model is pinned to a tier. A tier's candidates are
-all models whose ``max_tier`` covers it; ``recommended`` is the usable one
-with the highest quota score, then the highest ``bench`` (benchmark index)
-among equal scores, then the cheapest. ``candidates`` is always
-returned in that order so the caller can apply its own policy instead.
+the dispatchable models whose catalog-derived ``[min_tier, max_tier]`` interval
+contains it (``review`` uses the derived ``reviewer`` flag); ``recommended`` is
+the usable one with the highest quota score, then the highest ``bench``
+(benchmark index) among equal scores, then the cheapest. ``candidates`` is
+always returned in that order so the caller can apply its own policy instead.
 
 Dispatch feedback (see ``app.services.routing_feedback``): a pool that a
 subagent just found rate-limited or broken is ``cooling`` until
@@ -81,17 +82,6 @@ LOOKBACK_HOURS = {"5h": 2.0, "1w": 24.0, "1w-fable": 24.0}
 IDLE_BURN_PER_HOUR = 0.05
 
 CATALOG = load_catalog()
-
-# Vendor CLI pool → (provider, {slot: window matcher}).
-# Slots are normalised names so callers never see provider-specific keys.
-POOLS: dict[str, dict[str, Any]] = {
-    pool_id: {
-        "provider": ProviderId(pool["provider"]),
-        "display_name": pool["display_name"],
-        "slots": dict(pool["slots"]),
-    }
-    for pool_id, pool in CATALOG.pools.items()
-}
 
 
 def _tier_int(tier_str: str | None) -> int | None:

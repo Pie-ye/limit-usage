@@ -460,8 +460,9 @@ def test_derived_fields_and_catalog_shape(fake_catalog):
     assert cat["cli_models"] is None
 
 
-def test_smoke_real_catalog():
-    payload = build_routing_payload([], now=NOW)
+def test_smoke_real_catalog(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("CATALOG_DIR", raising=False)
+    payload = build_routing_payload([], now=NOW, catalog=load_catalog())
     assert set(c["model"] for c in payload["tiers"]["T3"]["candidates"]) == {
         "gpt-5.6-sol",
         "grok-4.6",

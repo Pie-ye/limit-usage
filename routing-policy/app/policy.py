@@ -77,6 +77,9 @@ class Policy(_PolicyModel):
     def tier_candidates(self, tier_id: str) -> list[str]:
         """Return eligible model ids ordered by blended price and model id."""
 
+        if tier_id != "review" and tier_id not in self.tiers:
+            raise KeyError(tier_id)
+
         if tier_id == "review":
             candidates = [
                 model_id

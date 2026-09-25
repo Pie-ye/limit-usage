@@ -19,8 +19,10 @@ Designed for public Internet exposure through Cloudflare Tunnel, this service en
 - Upstream error messages or server exception tracebacks
 - Raw provider quota percentages or full upstream telemetry payloads
 - Pool IDs or internal provider configurations
-- Model benchmark scores (`bench`), blended prices (`blended_price`), or effort (`effort`)
+- Model benchmark scores (`bench`) or blended prices (`blended_price`)
 - Cooldown schedules or minute-by-minute rate-limit counters
+
+`/v1/recommend` does return each recommended target's `effort` (the reasoning intensity passed to the CLI), but it does not return benchmark scores, prices, or pool information.
 
 All unexpected exceptions result in a generic `500 Internal Server Error` with body `{"detail": "internal error"}`. Server logs capture solely the exception class name without tracebacks or upstream request URLs.
 
