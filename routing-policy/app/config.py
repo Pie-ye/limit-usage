@@ -28,7 +28,7 @@ VENDOR_ALIASES: dict[str, str] = {
     "xai": "grok",
 }
 
-# Recognized internal CLI pool vendors defined in policy/models.yaml.
+# Recognized internal CLI pool vendors (pool ids in catalog/models.yaml).
 INTERNAL_VENDORS: frozenset[str] = frozenset({"claude", "codex", "grok", "agy"})
 
 

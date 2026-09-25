@@ -19,7 +19,7 @@ Designed for public Internet exposure through Cloudflare Tunnel, this service en
 - Upstream error messages or server exception tracebacks
 - Raw provider quota percentages or full upstream telemetry payloads
 - Pool IDs or internal provider configurations
-- Model benchmark scores (`bench`) or cost ranks (`cost_rank`)
+- Model benchmark scores (`bench`), blended prices (`blended_price`), or effort (`effort`)
 - Cooldown schedules or minute-by-minute rate-limit counters
 
 All unexpected exceptions result in a generic `500 Internal Server Error` with body `{"detail": "internal error"}`. Server logs capture solely the exception class name without tracebacks or upstream request URLs.
@@ -41,7 +41,7 @@ Example response:
 ```json
 {
   "status": "ok",
-  "policy_version": "2026-09-15.1"
+  "policy_version": "2026-09-26.1"
 }
 ```
 
@@ -56,8 +56,8 @@ Example response:
 ```json
 {
   "schema_version": 1,
-  "policy_version": "2026-09-15.1",
-  "generated_at": "2026-09-15T03:00:00Z",
+  "policy_version": "2026-09-26.1",
+  "generated_at": "2026-09-26T03:00:00Z",
   "tiers": {
     "T0": {"complexity": [0, 2]},
     "T1": {"complexity": [3, 5]},
@@ -94,13 +94,13 @@ Request schema:
 Example response:
 ```json
 {
-  "policy_version": "2026-09-15.1",
-  "generated_at": "2026-09-15T03:01:12Z",
-  "expires_at": "2026-09-15T03:06:12Z",
+  "policy_version": "2026-09-26.1",
+  "generated_at": "2026-09-26T03:01:12Z",
+  "expires_at": "2026-09-26T03:06:12Z",
   "tier": "T2",
   "role": "implement",
-  "recommended": {"vendor": "agy", "model": "gemini-3.8-flash-high"},
-  "alternatives": [{"vendor": "codex", "model": "gpt-5.6-terra"}],
+  "recommended": {"vendor": "agy", "model": "gemini-3.8-flash-high", "effort": null},
+  "alternatives": [{"vendor": "codex", "model": "gpt-5.6-terra", "effort": "high"}],
   "reason_codes": ["tier_capable", "quota_healthy", "provider_healthy"],
   "wait_seconds": null
 }
@@ -118,7 +118,7 @@ Configured via environment variables using `pydantic-settings`:
 |---|---|---|
 | `HOST` | `127.0.0.1` | Local bind address. **Must strictly default to 127.0.0.1** to prevent unauthenticated network exposure. |
 | `PORT` | `50100` | HTTP service port. |
-| `POLICY_DIR` | `./policy` | Directory path containing declarative policy YAML definitions (`models.yaml`, `tiers.yaml`, `roles.yaml`). |
+| `POLICY_DIR` | `./policy` | Directory path containing declarative policy YAML definitions (`tiers.yaml`, `roles.yaml`). Shared model catalog is loaded from `CATALOG_DIR` or `/app/catalog`. |
 | `LIMIT_USAGE_ROUTING_URL` | `http://127.0.0.1:50048/api/routing` | Upstream limit-usage signal endpoint. |
 | `SIGNAL_TTL_SECONDS` | `30` | In-memory cache TTL for capacity signals to prevent upstream thundering herds. |
 | `SIGNAL_TIMEOUT_SECONDS` | `3.0` | Upstream HTTP request timeout. |
@@ -130,8 +130,10 @@ Configured via environment variables using `pydantic-settings`:
 
 `routing-policy` operates as a downstream consumer of `limit-usage`'s `GET /api/routing` endpoint.
 - **Current State**: Both services coexist. `limit-usage` maintains quota tracking and database polling while `routing-policy` consumes real-time pool health projections to make decoupled routing decisions.
+- **Shared Catalog**: Model data and capability derivation are sourced from the repository root `catalog/`. `policy/models.yaml` has been removed. Docker Compose build context is now the repository root (`context: .`) so `catalog/` is included.
+- **Signals & Usability**: In addition to pool quota signals, `signals` reads `models.<id>.usable` from `limit-usage`. Models marked unusable by limit-usage (e.g. unlisted in CLI models export, or temporarily marked missing via 404 feedback) will not be recommended.
+- **Candidate Ranking in v1**: The `ranking` field in `policy/roles.yaml` (`[availability, quota, capability, cost]`) is descriptive in v1, documenting the intent of candidate evaluation order. The sorting key is evaluated in `engine.py` as `(not eligible, not usable, -score, -bench, blended_price)` to maintain strict behavioral parity with `limit-usage`'s `routing_view` (sorting by quota `score`, then `bench`, then `blended_price`); changing the ranking sequence requires modifying `engine.py`.
 - **Future Direction**: The capacity signal layer will be migrated to OmniRoute once deployed, at which point `LIMIT_USAGE_ROUTING_URL` will be updated to point to the new signal provider without breaking the routing policy interface.
-- **Candidate Ranking in v1**: The `ranking` field in `policy/roles.yaml` (`[availability, quota, capability, cost]`) is descriptive in v1, documenting the intent of candidate evaluation order. The sorting key is hardcoded in `engine.py` to maintain strict behavioral parity with `limit-usage`'s `routing_view`; changing the ranking sequence requires modifying `engine.py`.
 
 ---
 
