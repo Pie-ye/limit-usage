@@ -30,7 +30,7 @@ WEB_DIR = Path(__file__).resolve().parent / "web"
 
 class RoutingFeedback(BaseModel):
     """One dispatch outcome. ``model`` resolves the pool; ``pool`` is the
-    fallback when the model is not in ``MODELS`` (unknown ids are rejected)."""
+    fallback when the model is not in the catalog (unknown ids are rejected)."""
 
     model: str | None = None
     pool: str | None = None
@@ -291,15 +291,15 @@ def create_app() -> FastAPI:
         """
         from fastapi import HTTPException
 
-        from app.services.routing_view import MODELS, POOLS
+        from app.services.routing_view import CATALOG
 
         pool = body.pool
         if body.model:
-            spec = MODELS.get(body.model)
-            if spec is None:
+            derived = CATALOG.models.get(body.model)
+            if derived is None:
                 raise HTTPException(status_code=404, detail=f"Unknown model: {body.model}")
-            pool = spec["pool"]
-        elif pool and pool not in POOLS:
+            pool = derived.pool
+        elif pool and pool not in CATALOG.pools:
             raise HTTPException(status_code=404, detail=f"Unknown pool: {pool}")
         if not pool:
             raise HTTPException(status_code=422, detail="model or pool is required")

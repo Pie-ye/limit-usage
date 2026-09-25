@@ -59,6 +59,12 @@ from app.services.analytics import (
     compute_burn_estimate,
     extract_series_points,
 )
+from catalog.tiering import (
+    Catalog,
+    Derived,
+    load_catalog,
+    tier_candidates as catalog_tier_candidates,
+)
 
 # Data older than this is flagged ``stale`` (matches the 15-minute wording the
 # Claude card uses for "官方額度資料為 N 分鐘前").
@@ -73,104 +79,26 @@ LOOKBACK_HOURS = {"5h": 2.0, "1w": 24.0, "1w-fable": 24.0}
 # Below this %/hour the pool is considered idle (mirrors analytics ``idle``).
 IDLE_BURN_PER_HOUR = 0.05
 
+CATALOG = load_catalog()
+
 # Vendor CLI pool → (provider, {slot: window matcher}).
 # Slots are normalised names so callers never see provider-specific keys.
 POOLS: dict[str, dict[str, Any]] = {
-    "claude": {
-        "provider": ProviderId.CLAUDE,
-        "display_name": "Claude Code (claude)",
-        "slots": {"5h": "5h", "1w": "1w", "1w-fable": "1w-fable"},
-    },
-    "codex": {
-        "provider": ProviderId.CODEX,
-        "display_name": "Codex (codex)",
-        "slots": {"5h": "5h", "1w": "1w"},
-    },
-    "grok": {
-        "provider": ProviderId.SUPERGROK,
-        "display_name": "SuperGrok (grok)",
-        "slots": {"1w": "weekly"},
-    },
-    "agy": {
-        "provider": ProviderId.ANTIGRAVITY,
-        "display_name": "Antigravity · Gemini (agy)",
-        "slots": {"5h": "5h", "1w": "1w"},
-    },
-    "agy-3p": {
-        "provider": ProviderId.ANTIGRAVITY,
-        "display_name": "Antigravity · Claude/GPT (agy)",
-        "slots": {"5h": "3p-5h", "1w": "3p-1w"},
-    },
+    pool_id: {
+        "provider": ProviderId(pool["provider"]),
+        "display_name": pool["display_name"],
+        "slots": dict(pool["slots"]),
+    }
+    for pool_id, pool in CATALOG.pools.items()
 }
 
-# Every model the four local CLIs expose (claude / codex / grok / agy), with:
-#   pool       quota pool it draws on
-#   slots      which windows bind it
-#   max_tier   hardest tier it may take, set from benchmarks (2026-09-10):
-#              T3 ≈ SWE-bench Pro ≥ ~65 or Terminal-Bench 4.0 top group
-#              T2 ≈ SWE-bench Pro ~60–65 / Terminal-Bench 2.1 ≥ ~84
-#              T1 ≈ previous-gen or reduced-effort variants
-#              T0 ≈ no published coding benchmark, "fast and affordable"
-#   bench      composite coding-benchmark index (0–100, higher = stronger),
-#              derived from the same evidence as max_tier; used as the
-#              tie-break after quota score so equal-quota candidates (same
-#              pool) resolve to the strongest model, not the cheapest
-#   cost_rank  price order, cheapest first; last tie-break only
-#   role       "orchestrator" (may run the planning session; also dispatchable
-#              at its tier) or "subagent" (dispatch only)
-#   reviewer   strong enough to cross-review T2/T3 work
-#   dispatchable=False  reported for its quota but never handed to dispatch
-# Evidence per row is in orchestrating-development references/routing.md.
-MODELS: dict[str, dict[str, Any]] = {
-    # --- agy (Antigravity, gemini-* only) ---
-    "gemini-3.8-flash-low": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 0, "cost_rank": 0, "bench": 55, "role": "subagent"},
-    "gemini-3.8-flash-medium": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 1, "bench": 70, "role": "subagent"},
-    "gemini-3.8-flash-high": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 2, "bench": 81, "role": "subagent"},
-    "gemini-3.1-pro-low": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 5, "bench": 65, "role": "subagent"},
-    "gemini-3.1-pro-high": {"pool": "agy", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 6, "bench": 74, "role": "subagent"},
-    # --- codex ---
-    "gpt-reserve": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 0, "cost_rank": 3, "bench": 50, "role": "subagent"},
-    "gpt-5.6-luna": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 7, "bench": 78, "role": "subagent"},
-    "gpt-5.5": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 9, "bench": 72, "role": "subagent"},
-    "gpt-5.6-terra": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 12, "bench": 82, "role": "subagent"},
-    "gpt-5.6-sol": {"pool": "codex", "slots": ["5h", "1w"], "max_tier": 3, "cost_rank": 13, "bench": 90, "role": "orchestrator", "reviewer": True},
-    # --- grok ---
-    "grok-4.5": {"pool": "grok", "slots": ["1w"], "max_tier": 2, "cost_rank": 8, "bench": 77, "role": "subagent"},
-    "grok-4.6": {"pool": "grok", "slots": ["1w"], "max_tier": 3, "cost_rank": 10, "bench": 86, "role": "orchestrator", "reviewer": True},
-    # --- claude ---
-    "claude-haiku-4-5-20251001": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 1, "cost_rank": 4, "bench": 60, "role": "subagent"},
-    "claude-sonnet-5": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 2, "cost_rank": 11, "bench": 80, "role": "subagent"},
-    "claude-opus-5": {"pool": "claude", "slots": ["5h", "1w"], "max_tier": 3, "cost_rank": 14, "bench": 92, "role": "orchestrator", "reviewer": True},
-    # Orchestrator-only: reported under ``models`` for its Fable weekly cap,
-    # never offered as a dispatch candidate (it would burn the planner's cap).
-    "claude-fable-5-1": {"pool": "claude", "slots": ["5h", "1w", "1w-fable"], "max_tier": 3, "cost_rank": 15, "bench": 95, "role": "orchestrator", "dispatchable": False},
-}
 
-# Tier = task difficulty score only (orchestrating-development P2: 0–2 T0,
-# 3–5 T1, 6–8 T2, 9–12 T3). No model is pinned to a tier: every model whose
-# ``max_tier`` covers the tier is a candidate, ranked by live quota score,
-# then ``bench``, then ``cost_rank``. ``review`` only admits ``reviewer`` models;
-# the cross-vendor rule (reviewer ≠ implementer vendor) is applied by dispatch,
-# which knows who actually implemented.
-TIER_LEVELS = {"T0": 0, "T1": 1, "T2": 2, "T3": 3}
-
-
-def tier_candidates(tier_id: str) -> list[str]:
-    if tier_id == "review":
-        pool = [m for m, spec in MODELS.items() if spec.get("reviewer")]
-    else:
-        level = TIER_LEVELS[tier_id]
-        pool = [
-            m for m, spec in MODELS.items()
-            if spec["max_tier"] >= level and spec.get("dispatchable", True)
-        ]
-    return sorted(pool, key=lambda m: MODELS[m]["cost_rank"])
-
-
-TIERS: dict[str, dict[str, Any]] = {
-    **{t: {"role": "implement", "candidates": tier_candidates(t)} for t in TIER_LEVELS},
-    "review": {"role": "review", "candidates": tier_candidates("review")},
-}
+def _tier_int(tier_str: str | None) -> int | None:
+    if tier_str is None:
+        return None
+    if tier_str.startswith("T") and tier_str[1:].isdigit():
+        return int(tier_str[1:])
+    return None
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -327,15 +255,26 @@ def build_routing_payload(
     avoid_vendor: str | None = None,
     vendors: Iterable[str] | None = None,
     min_score: float | None = None,
+    catalog: Catalog | None = None,
 ) -> dict[str, Any]:
+    active_catalog = catalog if catalog is not None else CATALOG
     current = _as_utc(now or utcnow())
     history_by_provider = history_by_provider or {}
     cooldowns = cooldowns or {}
     vendor_set = {v.strip() for v in vendors if v.strip()} if vendors else None
     by_id = {s.provider: s for s in snapshots}
 
+    pools_spec = {
+        pool_id: {
+            "provider": ProviderId(pool["provider"]),
+            "display_name": pool["display_name"],
+            "slots": dict(pool["slots"]),
+        }
+        for pool_id, pool in active_catalog.pools.items()
+    }
+
     pools_out: dict[str, Any] = {}
-    for pool_id, spec in POOLS.items():
+    for pool_id, spec in pools_spec.items():
         snap = by_id.get(spec["provider"])
         cooldown = _cooldown_view(cooldowns, pool_id)
         if snap is None:
@@ -385,21 +324,28 @@ def build_routing_payload(
         }
 
     models_out: dict[str, Any] = {}
-    for model_id, spec in MODELS.items():
-        pool = pools_out.get(spec["pool"])
+    for model_id, d in active_catalog.models.items():
+        pool = pools_out.get(d.pool)
         if not pool:
             continue
-        scored = _score(pool["windows"], spec["slots"])
+        scored = _score(pool["windows"], list(d.slots))
         binding = pool["windows"].get(scored["binding_slot"]) if scored["binding_slot"] else None
         models_out[model_id] = {
-            "vendor": spec["pool"].split("-", 1)[0],
-            "pool": spec["pool"],
-            "slots": spec["slots"],
-            "role": spec["role"],
-            "max_tier": spec["max_tier"],
-            "bench": spec["bench"],
-            "cost_rank": spec["cost_rank"],
-            "dispatchable": spec.get("dispatchable", True),
+            "vendor": d.vendor,
+            "pool": d.pool,
+            "slots": list(d.slots),
+            "role": d.role,
+            "max_tier": _tier_int(d.max_tier),
+            "min_tier": _tier_int(d.min_tier),
+            "tiers": list(d.tiers),
+            "bench": d.bench,
+            "blended_price": d.blended_price,
+            "effort": d.effort,
+            "reviewer": d.reviewer,
+            "orchestrator": d.orchestrator,
+            "dispatchable": d.dispatchable,
+            "listed": None,
+            "missing": None,
             "status": pool["status"],
             "stale": pool["stale"],
             "usable": (
@@ -430,16 +376,19 @@ def build_routing_payload(
 
     filters_active = bool(avoid_vendor) or vendor_set is not None or min_score is not None
 
+    tier_list = list(active_catalog.tier_ids) + ["review"]
     tiers_out: dict[str, Any] = {}
-    for tier_id, spec in TIERS.items():
+    for tier_id in tier_list:
+        role = "review" if tier_id == "review" else "implement"
+        candidates = catalog_tier_candidates(active_catalog, tier_id)
         ranked = sorted(
-            (m for m in spec["candidates"] if m in models_out),
+            (m for m in candidates if m in models_out),
             key=lambda m: (
                 not _eligible(m),
                 not models_out[m]["usable"],
                 -(models_out[m]["score"] if models_out[m]["score"] is not None else -1.0),
-                -MODELS[m]["bench"],
-                MODELS[m]["cost_rank"],
+                -active_catalog.models[m].bench,
+                active_catalog.models[m].blended_price,
             ),
         )
         eligible = [m for m in ranked if _eligible(m)]
@@ -460,7 +409,7 @@ def build_routing_payload(
         if wait is not None:
             reason += f"; earliest candidate back in {wait}s"
         tiers_out[tier_id] = {
-            "role": spec["role"],
+            "role": role,
             "recommended": recommended,
             "vendor": rec.get("vendor"),
             "usable_candidates": usable_n,
@@ -472,10 +421,12 @@ def build_routing_payload(
                 {
                     "model": m,
                     "vendor": models_out[m]["vendor"],
-                    "role": MODELS[m]["role"],
-                    "max_tier": MODELS[m]["max_tier"],
-                    "bench": MODELS[m]["bench"],
-                    "cost_rank": MODELS[m]["cost_rank"],
+                    "role": active_catalog.models[m].role,
+                    "max_tier": _tier_int(active_catalog.models[m].max_tier),
+                    "min_tier": _tier_int(active_catalog.models[m].min_tier),
+                    "bench": active_catalog.models[m].bench,
+                    "blended_price": active_catalog.models[m].blended_price,
+                    "effort": active_catalog.models[m].effort,
                     "score": models_out[m]["score"],
                     "level": models_out[m]["level"],
                     "usable": models_out[m]["usable"],
@@ -502,19 +453,27 @@ def build_routing_payload(
             "level": {"critical_max": CRITICAL_REMAINING_PCT, "low_max": LOW_REMAINING_PCT},
             "usable": "status == ok and level not in (critical, unknown) and pool not cooling after dispatch feedback",
             "eligible": "usable and passes avoid_vendor / vendors / min_score filters",
-            "candidates": "every model whose max_tier covers the tier (review: reviewer models)",
-            "recommended": "highest quota score among eligible candidates; bench (benchmark index) breaks ties, then cost_rank",
+            "candidates": "every dispatchable model whose derived tier range [min_tier, max_tier] contains the tier (review: derived reviewers)",
+            "recommended": "highest quota score among eligible candidates; bench (benchmark index) breaks ties, then blended_price",
+            "tiering": "blended = (input*blend.input + output*blend.output)/(blend.input+blend.output); max_tier = highest tier with bench >= min_bench; min_tier = lowest tier with blended <= max_blended_price",
             "wait_seconds": "when nothing is eligible: earliest cooldown end or window reset among candidates",
+        },
+        "catalog": {
+            "catalog_version": active_catalog.catalog_version,
+            "blend": dict(active_catalog.blend),
+            "thresholds": {t: dict(v) for t, v in active_catalog.thresholds.items()},
+            "uncatalogued": {},
+            "cli_models": None,
         },
         "pools": pools_out,
         "models": models_out,
         "orchestrators": sorted(
-            (m for m, spec in MODELS.items() if spec["role"] == "orchestrator" and m in models_out),
+            (m for m, d in active_catalog.models.items() if d.orchestrator and m in models_out),
             key=lambda m: (
                 not models_out[m]["usable"],
                 -(models_out[m]["score"] if models_out[m]["score"] is not None else -1.0),
-                -MODELS[m]["bench"],
-                MODELS[m]["cost_rank"],
+                -active_catalog.models[m].bench,
+                active_catalog.models[m].blended_price,
             ),
         ),
         "tiers": tiers_out,

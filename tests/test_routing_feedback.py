@@ -1,7 +1,10 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
 from app.models import ProviderId
 from app.services.routing_feedback import (
@@ -15,14 +18,20 @@ from app.services.routing_feedback import (
     classify,
 )
 from app.services.routing_view import build_routing_payload
-from tests.test_routing_view import NOW, _all_ok, _snap, _win
+from catalog.tiering import Catalog
+from tests.test_routing_view import NOW, _all_ok, _snap, _win, make_fake_catalog
+
+
+@pytest.fixture
+def fake_catalog(tmp_path: Path) -> Catalog:
+    return make_fake_catalog(tmp_path)
 
 
 # --- classify -----------------------------------------------------------------
 
 def test_classify_text_rules_win_over_status():
     # 403 with a rate-limit message is a rate limit, not an auth failure
-    out = classify(403, "Rate limit reached for gpt-5.6-terra")
+    out = classify(403, "Rate limit reached for model-terra")
     assert out["kind"] == "rate_limit"
     assert out["backoff_level"] == 1
     assert out["cooldown_seconds"] == BACKOFF_BASE_SECONDS
@@ -51,7 +60,7 @@ def test_backoff_doubles_and_caps():
 def test_registry_rate_limit_escalates_and_success_clears():
     reg = FeedbackRegistry()
     t0 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
-    r1 = reg.report("codex", ok=False, status=429, model="gpt-5.6-terra", now=t0)
+    r1 = reg.report("codex", ok=False, status=429, model="model-terra", now=t0)
     assert r1["kind"] == "rate_limit"
     assert r1["cooldown_seconds"] == 60
     assert r1["cooling"] is True
@@ -65,7 +74,7 @@ def test_registry_rate_limit_escalates_and_success_clears():
     assert r2["backoff_level"] == 2
     assert r2["cooldown_seconds"] == 120
     # success clears everything
-    r3 = reg.report("codex", ok=True, model="gpt-5.6-terra", now=t0 + timedelta(seconds=80))
+    r3 = reg.report("codex", ok=True, model="model-terra", now=t0 + timedelta(seconds=80))
     assert r3["kind"] == "ok"
     assert r3["cooling"] is False
     assert r3["backoff_level"] == 0
@@ -106,17 +115,17 @@ def test_registry_clear():
 
 # --- payload integration --------------------------------------------------------
 
-def test_cooldown_makes_pool_and_models_unusable():
+def test_cooldown_makes_pool_and_models_unusable(fake_catalog):
     cooldowns = {"codex": {"cooling": True, "unavailable_until": "2026-09-10T12:01:00Z", "seconds_left": 60,
                            "backoff_level": 1, "kind": "rate_limit", "last_error": "429"}}
-    out = build_routing_payload(_all_ok(), now=NOW, cooldowns=cooldowns)
+    out = build_routing_payload(_all_ok(), now=NOW, cooldowns=cooldowns, catalog=fake_catalog)
     assert out["pools"]["codex"]["usable"] is False
     assert out["pools"]["codex"]["cooldown"]["cooling"] is True
     assert out["pools"]["codex"]["cooldown"]["seconds_left"] == 60
     assert out["pools"]["claude"]["cooldown"]["cooling"] is False
-    terra = out["models"]["gpt-5.6-terra"]
-    assert terra["usable"] is False
-    assert terra["cooldown"]["kind"] == "rate_limit"
+    mid = out["models"]["model-codex-mid"]
+    assert mid["usable"] is False
+    assert mid["cooldown"]["kind"] == "rate_limit"
     # codex was the top T2 pick in the all-ok fixture; now it drops behind
     t2 = out["tiers"]["T2"]
     assert t2["vendor"] != "codex"
@@ -124,8 +133,8 @@ def test_cooldown_makes_pool_and_models_unusable():
     assert all(c["cooling"] and not c["usable"] and c["wait_seconds"] == 60 for c in codex_rows)
 
 
-def test_avoid_vendor_and_vendors_filters_affect_eligible_only():
-    out = build_routing_payload(_all_ok(), now=NOW, avoid_vendor="codex")
+def test_avoid_vendor_and_vendors_filters_affect_eligible_only(fake_catalog):
+    out = build_routing_payload(_all_ok(), now=NOW, avoid_vendor="codex", catalog=fake_catalog)
     t2 = out["tiers"]["T2"]
     assert t2["vendor"] != "codex"
     codex_rows = [c for c in t2["candidates"] if c["vendor"] == "codex"]
@@ -133,37 +142,37 @@ def test_avoid_vendor_and_vendors_filters_affect_eligible_only():
     assert t2["eligible_candidates"] == t2["usable_candidates"] - len(codex_rows)
     assert out["filters"]["avoid_vendor"] == "codex"
 
-    out = build_routing_payload(_all_ok(), now=NOW, vendors=["claude", "codex"])
+    out = build_routing_payload(_all_ok(), now=NOW, vendors=["claude", "codex"], catalog=fake_catalog)
     for tier in ("T0", "T1", "T2", "T3", "review"):
         assert out["tiers"][tier]["vendor"] in {"claude", "codex"}
         assert all(c["vendor"] in {"claude", "codex"} for c in out["tiers"][tier]["candidates"] if c["eligible"])
     assert out["filters"]["vendors"] == ["claude", "codex"]
 
 
-def test_min_score_filter():
-    out = build_routing_payload(_all_ok(), now=NOW, min_score=99.0)
+def test_min_score_filter(fake_catalog):
+    out = build_routing_payload(_all_ok(), now=NOW, min_score=99.0, catalog=fake_catalog)
     t3 = out["tiers"]["T3"]
     assert t3["eligible_candidates"] == 0
-    assert t3["usable_candidates"] == 3
+    assert t3["usable_candidates"] == 4
     assert "caller's filters" in t3["reason"]
     # candidates keep their usable flag; recommended is still the best row
-    assert t3["recommended"] == "gpt-5.6-sol"
+    assert t3["recommended"] == "model-codex-top"
 
 
-def test_wait_seconds_when_nothing_eligible():
+def test_wait_seconds_when_nothing_eligible(fake_catalog):
     # claude 5h critical (resets in 11000 s), codex cooling 300 s, grok missing.
     snaps = [s for s in _all_ok(claude_5h_used=95.0) if s.provider != ProviderId.SUPERGROK]
     cooldowns = {"codex": {"cooling": True, "seconds_left": 300, "backoff_level": 1, "kind": "rate_limit"}}
-    out = build_routing_payload(snaps, now=NOW, cooldowns=cooldowns)
+    out = build_routing_payload(snaps, now=NOW, cooldowns=cooldowns, catalog=fake_catalog)
     t3 = out["tiers"]["T3"]
     assert t3["eligible_candidates"] == 0
     assert t3["wait_seconds"] == 300
     assert t3["next_available_at"] == (NOW + timedelta(seconds=300)).isoformat().replace("+00:00", "Z")
     assert "back in 300s" in t3["reason"]
     by_model = {c["model"]: c for c in t3["candidates"]}
-    assert by_model["gpt-5.6-sol"]["wait_seconds"] == 300
-    assert by_model["claude-opus-5"]["wait_seconds"] == 11_000
-    assert by_model["grok-4.6"]["wait_seconds"] is None  # missing provider: unknown
+    assert by_model["model-codex-top"]["wait_seconds"] == 300
+    assert by_model["model-c-top"]["wait_seconds"] == 11_000
+    assert by_model["model-g-top"]["wait_seconds"] is None  # missing provider: unknown
     # with something eligible there is no wait
     assert out["tiers"]["T2"]["wait_seconds"] is None
     assert out["tiers"]["T2"]["vendor"] == "agy"
@@ -195,20 +204,18 @@ def _client():
     return TestClient(app)
 
 
-from contextlib import asynccontextmanager
-
-
 @asynccontextmanager
 async def _noop_lifespan(app):
     yield
 
 
-def test_feedback_endpoint_round_trip():
+def test_feedback_endpoint_round_trip(fake_catalog, monkeypatch):
+    monkeypatch.setattr("app.services.routing_view.CATALOG", fake_catalog)
     with _client() as c:
         before = c.get("/api/routing?tier=T2").json()
         assert before["vendor"] == "codex"
 
-        r = c.post("/api/routing/feedback", json={"model": "gpt-5.6-terra", "status": 429, "error": "rate limit"})
+        r = c.post("/api/routing/feedback", json={"model": "model-codex-mid", "status": 429, "error": "rate limit"})
         assert r.status_code == 200
         assert r.json()["pool"] == "codex"
         assert r.json()["kind"] == "rate_limit"
@@ -216,7 +223,7 @@ def test_feedback_endpoint_round_trip():
 
         after = c.get("/api/routing?tier=T2").json()
         assert after["vendor"] != "codex"
-        assert c.get("/api/routing?model=gpt-5.6-sol").json()["usable"] is False
+        assert c.get("/api/routing?model=model-codex-top").json()["usable"] is False
         state = c.get("/api/routing/feedback").json()
         assert state["pools"]["codex"]["cooling"] is True
 
@@ -225,7 +232,7 @@ def test_feedback_endpoint_round_trip():
         assert filt["vendor"] == "claude"
         assert filt["eligible_candidates"] >= 1
 
-        ok = c.post("/api/routing/feedback", json={"model": "gpt-5.6-terra", "ok": True})
+        ok = c.post("/api/routing/feedback", json={"model": "model-codex-mid", "ok": True})
         assert ok.json()["cooling"] is False
         assert c.get("/api/routing?tier=T2").json()["vendor"] == "codex"
 
