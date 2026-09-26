@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -29,6 +29,7 @@ class SignalResult:
     stale: bool
     degraded: bool
     fetched_at: datetime | None
+    models: dict[str, bool] = field(default_factory=dict)
 
 
 class SignalSource:
@@ -82,6 +83,7 @@ class SignalSource:
 
                 pools = data["pools"]
                 signals: Signals = {}
+                models: dict[str, bool] = {}
 
                 for pool_id, pool_data in pools.items():
                     if not isinstance(pool_data, dict):
@@ -114,12 +116,22 @@ class SignalSource:
                         # Skip pools with malformed structure to isolate blast radius of upstream schema drift.
                         continue
 
+                raw_models = data.get("models")
+                if isinstance(raw_models, dict):
+                    for model_id, model_data in raw_models.items():
+                        if (
+                            isinstance(model_data, dict)
+                            and isinstance(model_data.get("usable"), bool)
+                        ):
+                            models[str(model_id)] = model_data["usable"]
+
                 # We consider the overall fetch fresh if we successfully parsed at least the container.
                 result = SignalResult(
                     signals=signals,
                     stale=False,
                     degraded=False,
                     fetched_at=actual_now,
+                    models=models,
                 )
                 self._last_success = result
                 self._last_result = result
@@ -138,6 +150,7 @@ class SignalSource:
                         stale=True,
                         degraded=False,
                         fetched_at=self._last_success.fetched_at,
+                        models=self._last_success.models,
                     )
                 else:
                     result = SignalResult(
@@ -145,8 +158,9 @@ class SignalSource:
                         stale=True,
                         degraded=True,
                         fetched_at=None,
+                        models={},
                     )
-                
+
                 self._last_result = result
                 self._last_fetch_time = current_time
                 return result

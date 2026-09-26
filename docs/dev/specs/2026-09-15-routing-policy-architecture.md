@@ -1,5 +1,7 @@
 # 規格 — Routing Policy Service（節錄自使用者架構報告 2026-09-15）
 
+> 2026-09-26 更新：模型資料與能力推導已移到 repo 根目錄 `catalog/`，見 `docs/dev/specs/2026-09-26-model-tier-derivation.md`；本文件中的 `max_tier`／`cost_rank` 等人工欄位已不存在。
+
 本檔是使用者提供之《limit-usage 瘦身、OmniRoute 整合與跨網路 Subagent Routing 架構規劃報告》
 的實作面節錄，作為本次 PR1–PR4 的規格來源。三層責任劃分與 API 形狀直接引用報告。
 

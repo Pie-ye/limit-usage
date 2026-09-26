@@ -18,6 +18,7 @@ from app.providers.registry import build_providers
 from app.services.poller import UsagePoller
 from app.services.remote_claude import RemoteClaudeRegistry
 from app.services.routing_feedback import FeedbackRegistry
+from catalog.tiering import Catalog, load_catalog
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +31,7 @@ WEB_DIR = Path(__file__).resolve().parent / "web"
 
 class RoutingFeedback(BaseModel):
     """One dispatch outcome. ``model`` resolves the pool; ``pool`` is the
-    fallback when the model is not in ``MODELS`` (unknown ids are rejected)."""
+    fallback when the model is not in the catalog (unknown ids are rejected)."""
 
     model: str | None = None
     pool: str | None = None
@@ -56,6 +57,7 @@ class ClaudeIngest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    catalog = load_catalog()
     settings = get_settings()
     repo = Repository(settings.db_path)
     remote_claude = RemoteClaudeRegistry()
@@ -67,6 +69,7 @@ async def lifespan(app: FastAPI):
         max_backoff_seconds=settings.max_backoff_seconds,
         refresh_min_interval_seconds=settings.refresh_min_interval_seconds,
     )
+    app.state.catalog = catalog
     app.state.settings = settings
     app.state.repository = repo
     app.state.poller = poller
@@ -74,10 +77,11 @@ async def lifespan(app: FastAPI):
     app.state.remote_claude = remote_claude
     poller.start()
     logger.info(
-        "limit-usage v%s listening config port=%s db=%s",
+        "limit-usage v%s listening config port=%s db=%s catalog=%s",
         __version__,
         settings.port,
         settings.db_path,
+        catalog.catalog_version,
     )
     yield
     await poller.stop()
@@ -218,25 +222,34 @@ def create_app() -> FastAPI:
         from datetime import timedelta
 
         from app.models import utcnow
+        from app.services.cli_models import load_cli_models
         from app.services.routing_view import LOOKBACK_HOURS, build_routing_payload
 
         repo: Repository = request.app.state.repository
         poller: UsagePoller = request.app.state.poller
         feedback: FeedbackRegistry = request.app.state.routing_feedback
+        now = utcnow()
         snaps = poller.get_snapshots()
-        since = utcnow() - timedelta(hours=max(LOOKBACK_HOURS.values()))
+        since = now - timedelta(hours=max(LOOKBACK_HOURS.values()))
         history_by: dict = {
             s.provider.value: repo.get_history(provider=s.provider.value, limit=20000, since=since)
             for s in snaps
         }
+        settings = get_settings()
+        cli_models = load_cli_models(settings.cli_models_path, now=now)
+        missing_models = feedback.missing_models(now=now)
         return build_routing_payload(
             snaps,
             history_by,
+            now=now,
             stale_after_seconds=stale_after,
-            cooldowns=feedback.active(),
+            cooldowns=feedback.active(now=now),
+            missing_models=missing_models,
+            cli_models=cli_models,
             avoid_vendor=avoid_vendor,
             vendors=vendors,
             min_score=min_score,
+            catalog=request.app.state.catalog,
         )
 
     @api.get("/routing")
@@ -291,15 +304,14 @@ def create_app() -> FastAPI:
         """
         from fastapi import HTTPException
 
-        from app.services.routing_view import MODELS, POOLS
-
+        catalog: Catalog = request.app.state.catalog
         pool = body.pool
         if body.model:
-            spec = MODELS.get(body.model)
-            if spec is None:
+            derived = catalog.models.get(body.model)
+            if derived is None:
                 raise HTTPException(status_code=404, detail=f"Unknown model: {body.model}")
-            pool = spec["pool"]
-        elif pool and pool not in POOLS:
+            pool = derived.pool
+        elif pool and pool not in catalog.pools:
             raise HTTPException(status_code=404, detail=f"Unknown pool: {pool}")
         if not pool:
             raise HTTPException(status_code=422, detail="model or pool is required")

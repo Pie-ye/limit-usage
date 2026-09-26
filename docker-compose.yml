@@ -24,6 +24,7 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-60}"
       DATABASE_PATH: "/app/data/usage.db"
+      CLI_MODELS_PATH: "/app/data/cli-models.json"
       CODEX_AUTH_PATH: "/secrets/codex/auth.json"
       GROK_AUTH_PATH: "/secrets/grok/auth.json"
       ANTIGRAVITY_TOKEN_PATH: "/secrets/antigravity/acp_token.json"
@@ -84,7 +85,9 @@ services:
       start_period: 15s
 
   routing-policy:
-    build: ./routing-policy
+    build:
+      context: .
+      dockerfile: routing-policy/Dockerfile
     image: routing-policy:local
     container_name: routing-policy
     ports:

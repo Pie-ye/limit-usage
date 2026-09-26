@@ -1,0 +1,16 @@
+[Unit]
+Description=Export codex/agy/grok available model lists for limit-usage routing
+
+[Service]
+Type=oneshot
+# The limit-usage container has none of the vendor CLIs and cannot see
+# ~/.codex/, so the host writes each CLI's current model list into the data
+# directory the container mounts. A model that disappears from its CLI's list
+# stops being routed to. Runs `agy models` and `grok models`; grok may refresh
+# ~/.grok/auth.json as part of its normal login handling.
+ExecStart=/usr/bin/python3 %h/Container/limit-usage/deploy/cli-models-export.py
+StandardOutput=null
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target

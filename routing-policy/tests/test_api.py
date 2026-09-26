@@ -116,7 +116,7 @@ def test_health_endpoint_exact_keys(client: TestClient) -> None:
 def test_policy_endpoint_no_internal_model_or_scoring_keys(
     client: TestClient,
 ) -> None:
-    """Case b: GET /v1/policy must not leak model IDs, bench, cost_rank, pool, or provider keys."""
+    """Case b: GET /v1/policy must not leak model inventory or scoring fields."""
     response = client.get("/v1/policy")
     assert response.status_code == 200
     text = response.text
@@ -127,7 +127,14 @@ def test_policy_endpoint_no_internal_model_or_scoring_keys(
     for model_id in policy.models.keys():
         assert model_id not in text, f"Found leaked model id: {model_id}"
 
-    forbidden_keys = ("bench", "cost_rank", "pool", "provider")
+    forbidden_keys = (
+        "bench",
+        "blended_price",
+        "effort",
+        "cost_rank",
+        "pool",
+        "provider",
+    )
     for key in forbidden_keys:
         assert key not in text, f"Found leaked policy attribute: {key}"
 
@@ -157,6 +164,13 @@ def test_recommend_normal_path_ttl_difference(client: TestClient) -> None:
         "wait_seconds",
     }
     assert set(data.keys()) == expected_keys
+    assert data["policy_version"] == "2026-09-26.1"
+    assert data["recommended"] is not None
+    assert data["recommended"]["effort"] == "max"
+    selected_model = data["recommended"]["model"]
+    assert data["recommended"]["effort"] == (
+        client.app.state.policy.models[selected_model].effort
+    )
 
     gen_dt = datetime.fromisoformat(data["generated_at"].replace("Z", "+00:00"))
     exp_dt = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))
@@ -336,17 +350,21 @@ def test_recommend_response_does_not_leak_internal_keys(
     }
     assert set(data.keys()) == allowed_top_keys
 
-    # 2. recommended and alternatives keys strictly {vendor, model}
+    # 2. recommended and alternatives expose only the public target and effort.
     if data["recommended"] is not None:
-        assert set(data["recommended"].keys()) == {"vendor", "model"}
+        assert set(data["recommended"].keys()) == {"vendor", "model", "effort"}
         assert isinstance(data["recommended"]["vendor"], str)
         assert isinstance(data["recommended"]["model"], str)
+        assert data["recommended"]["effort"] is None or isinstance(
+            data["recommended"]["effort"], str
+        )
 
     assert isinstance(data["alternatives"], list)
     for alt in data["alternatives"]:
-        assert set(alt.keys()) == {"vendor", "model"}
+        assert set(alt.keys()) == {"vendor", "model", "effort"}
         assert isinstance(alt["vendor"], str)
         assert isinstance(alt["model"], str)
+        assert alt["effort"] is None or isinstance(alt["effort"], str)
 
     # 3. reason_codes are strictly within the engine's fixed REASON_CODES set
     from app.engine import REASON_CODES
@@ -419,7 +437,7 @@ def test_recommend_audit_log_format_and_content(
     assert "tier=T2" in log_msg
     assert "role=implement" in log_msg
     assert "model=" in log_msg
-    assert "policy_version=2026-09-15.1" in log_msg
+    assert "policy_version=2026-09-26.1" in log_msg
     assert "status=200" in log_msg
     assert "elapsed=" in log_msg
 

@@ -25,6 +25,10 @@ class MockHandler:
 
 def create_valid_upstream_payload() -> dict:
     return {
+        "models": {
+            "model-claude": {"usable": True},
+            "model-disabled": {"usable": False},
+        },
         "pools": {
             "claude": {
                 "provider": "claude",
@@ -65,6 +69,10 @@ async def test_normal_projection() -> None:
     assert not result.stale
     assert not result.degraded
     assert result.fetched_at == now
+    assert result.models == {
+        "model-claude": True,
+        "model-disabled": False,
+    }
     assert "claude" in result.signals
 
     c = result.signals["claude"]
@@ -147,7 +155,19 @@ async def test_fallback_when_previously_successful() -> None:
     handler = MockHandler()
     handler.response = httpx.Response(
         200,
-        json={"pools": {"pool1": {"usable": True, "score": 10, "level": "ok", "cooldown": {"cooling": False}, "binding_slot": None, "stale": False}}}
+        json={
+            "models": {"model-pool1": {"usable": False}},
+            "pools": {
+                "pool1": {
+                    "usable": True,
+                    "score": 10,
+                    "level": "ok",
+                    "cooldown": {"cooling": False},
+                    "binding_slot": None,
+                    "stale": False,
+                }
+            },
+        },
     )
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport)
@@ -171,6 +191,7 @@ async def test_fallback_when_previously_successful() -> None:
     assert res2.stale is True
     assert res2.degraded is False
     assert res2.signals == res1.signals
+    assert res2.models == {"model-pool1": False}
 
 
 @pytest.mark.asyncio
@@ -190,6 +211,7 @@ async def test_downgrade_when_never_successful() -> None:
     assert res.stale is True
     assert res.degraded is True
     assert res.signals == {}
+    assert res.models == {}
 
 
 @pytest.mark.asyncio
@@ -245,6 +267,43 @@ async def test_broken_pool_skipped() -> None:
 
     assert "claude" in result.signals
     assert "broken" not in result.signals
+
+
+@pytest.mark.asyncio
+async def test_missing_models_defaults_to_empty_mapping() -> None:
+    handler = MockHandler()
+    handler.response = httpx.Response(200, json={"pools": {}})
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+
+    source = SignalSource(client=client)
+    with patch("app.signals.time.monotonic", return_value=100.0):
+        result = await source.get()
+
+    assert result.models == {}
+
+
+@pytest.mark.asyncio
+async def test_malformed_model_usability_entries_are_skipped() -> None:
+    payload = {
+        "pools": {},
+        "models": {
+            "model-good": {"usable": True},
+            "model-not-bool": {"usable": 1},
+            "model-missing": {"listed": True},
+            "model-not-mapping": False,
+        },
+    }
+    handler = MockHandler()
+    handler.response = httpx.Response(200, json=payload)
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+
+    source = SignalSource(client=client)
+    with patch("app.signals.time.monotonic", return_value=100.0):
+        result = await source.get()
+
+    assert result.models == {"model-good": True}
 
 
 @pytest.mark.asyncio

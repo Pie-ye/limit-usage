@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     port: int = 50048
     poll_interval_seconds: int = Field(default=60, ge=15)
     database_path: str = "./data/usage.db"
+    cli_models_path: str = "./data/cli-models.json"
 
     codex_auth_path: str = "~/.codex/auth.json"
     grok_auth_path: str = "~/.grok/auth.json"

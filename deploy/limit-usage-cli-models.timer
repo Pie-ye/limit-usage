@@ -1,0 +1,13 @@
+[Unit]
+Description=Export CLI model lists for limit-usage every 6 hours
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=6h
+# limit-usage treats a list older than 48 h as unknown, so 6 h leaves room for
+# several missed runs before routing stops filtering.
+AccuracySec=5min
+Unit=limit-usage-cli-models.service
+
+[Install]
+WantedBy=timers.target

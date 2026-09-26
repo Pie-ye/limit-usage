@@ -1,7 +1,10 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
 from app.models import ProviderId
 from app.services.routing_feedback import (
@@ -10,19 +13,26 @@ from app.services.routing_feedback import (
     COOLDOWN_SHORT,
     COOLDOWN_TRANSIENT,
     MAX_COOLDOWN_SECONDS,
+    MODEL_MISSING_SECONDS,
     FeedbackRegistry,
     backoff_seconds,
     classify,
 )
 from app.services.routing_view import build_routing_payload
-from tests.test_routing_view import NOW, _all_ok, _snap, _win
+from catalog.tiering import Catalog
+from tests.test_routing_view import NOW, _all_ok, _snap, _win, make_fake_catalog
+
+
+@pytest.fixture
+def fake_catalog(tmp_path: Path) -> Catalog:
+    return make_fake_catalog(tmp_path)
 
 
 # --- classify -----------------------------------------------------------------
 
 def test_classify_text_rules_win_over_status():
     # 403 with a rate-limit message is a rate limit, not an auth failure
-    out = classify(403, "Rate limit reached for gpt-5.6-terra")
+    out = classify(403, "Rate limit reached for model-terra")
     assert out["kind"] == "rate_limit"
     assert out["backoff_level"] == 1
     assert out["cooldown_seconds"] == BACKOFF_BASE_SECONDS
@@ -51,7 +61,7 @@ def test_backoff_doubles_and_caps():
 def test_registry_rate_limit_escalates_and_success_clears():
     reg = FeedbackRegistry()
     t0 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
-    r1 = reg.report("codex", ok=False, status=429, model="gpt-5.6-terra", now=t0)
+    r1 = reg.report("codex", ok=False, status=429, model="model-terra", now=t0)
     assert r1["kind"] == "rate_limit"
     assert r1["cooldown_seconds"] == 60
     assert r1["cooling"] is True
@@ -65,7 +75,7 @@ def test_registry_rate_limit_escalates_and_success_clears():
     assert r2["backoff_level"] == 2
     assert r2["cooldown_seconds"] == 120
     # success clears everything
-    r3 = reg.report("codex", ok=True, model="gpt-5.6-terra", now=t0 + timedelta(seconds=80))
+    r3 = reg.report("codex", ok=True, model="model-terra", now=t0 + timedelta(seconds=80))
     assert r3["kind"] == "ok"
     assert r3["cooling"] is False
     assert r3["backoff_level"] == 0
@@ -106,17 +116,17 @@ def test_registry_clear():
 
 # --- payload integration --------------------------------------------------------
 
-def test_cooldown_makes_pool_and_models_unusable():
+def test_cooldown_makes_pool_and_models_unusable(fake_catalog):
     cooldowns = {"codex": {"cooling": True, "unavailable_until": "2026-09-10T12:01:00Z", "seconds_left": 60,
                            "backoff_level": 1, "kind": "rate_limit", "last_error": "429"}}
-    out = build_routing_payload(_all_ok(), now=NOW, cooldowns=cooldowns)
+    out = build_routing_payload(_all_ok(), now=NOW, cooldowns=cooldowns, catalog=fake_catalog)
     assert out["pools"]["codex"]["usable"] is False
     assert out["pools"]["codex"]["cooldown"]["cooling"] is True
     assert out["pools"]["codex"]["cooldown"]["seconds_left"] == 60
     assert out["pools"]["claude"]["cooldown"]["cooling"] is False
-    terra = out["models"]["gpt-5.6-terra"]
-    assert terra["usable"] is False
-    assert terra["cooldown"]["kind"] == "rate_limit"
+    mid = out["models"]["model-codex-mid"]
+    assert mid["usable"] is False
+    assert mid["cooldown"]["kind"] == "rate_limit"
     # codex was the top T2 pick in the all-ok fixture; now it drops behind
     t2 = out["tiers"]["T2"]
     assert t2["vendor"] != "codex"
@@ -124,8 +134,8 @@ def test_cooldown_makes_pool_and_models_unusable():
     assert all(c["cooling"] and not c["usable"] and c["wait_seconds"] == 60 for c in codex_rows)
 
 
-def test_avoid_vendor_and_vendors_filters_affect_eligible_only():
-    out = build_routing_payload(_all_ok(), now=NOW, avoid_vendor="codex")
+def test_avoid_vendor_and_vendors_filters_affect_eligible_only(fake_catalog):
+    out = build_routing_payload(_all_ok(), now=NOW, avoid_vendor="codex", catalog=fake_catalog)
     t2 = out["tiers"]["T2"]
     assert t2["vendor"] != "codex"
     codex_rows = [c for c in t2["candidates"] if c["vendor"] == "codex"]
@@ -133,37 +143,37 @@ def test_avoid_vendor_and_vendors_filters_affect_eligible_only():
     assert t2["eligible_candidates"] == t2["usable_candidates"] - len(codex_rows)
     assert out["filters"]["avoid_vendor"] == "codex"
 
-    out = build_routing_payload(_all_ok(), now=NOW, vendors=["claude", "codex"])
+    out = build_routing_payload(_all_ok(), now=NOW, vendors=["claude", "codex"], catalog=fake_catalog)
     for tier in ("T0", "T1", "T2", "T3", "review"):
         assert out["tiers"][tier]["vendor"] in {"claude", "codex"}
         assert all(c["vendor"] in {"claude", "codex"} for c in out["tiers"][tier]["candidates"] if c["eligible"])
     assert out["filters"]["vendors"] == ["claude", "codex"]
 
 
-def test_min_score_filter():
-    out = build_routing_payload(_all_ok(), now=NOW, min_score=99.0)
+def test_min_score_filter(fake_catalog):
+    out = build_routing_payload(_all_ok(), now=NOW, min_score=99.0, catalog=fake_catalog)
     t3 = out["tiers"]["T3"]
     assert t3["eligible_candidates"] == 0
-    assert t3["usable_candidates"] == 3
+    assert t3["usable_candidates"] == 4
     assert "caller's filters" in t3["reason"]
     # candidates keep their usable flag; recommended is still the best row
-    assert t3["recommended"] == "gpt-5.6-sol"
+    assert t3["recommended"] == "model-codex-top"
 
 
-def test_wait_seconds_when_nothing_eligible():
+def test_wait_seconds_when_nothing_eligible(fake_catalog):
     # claude 5h critical (resets in 11000 s), codex cooling 300 s, grok missing.
     snaps = [s for s in _all_ok(claude_5h_used=95.0) if s.provider != ProviderId.SUPERGROK]
     cooldowns = {"codex": {"cooling": True, "seconds_left": 300, "backoff_level": 1, "kind": "rate_limit"}}
-    out = build_routing_payload(snaps, now=NOW, cooldowns=cooldowns)
+    out = build_routing_payload(snaps, now=NOW, cooldowns=cooldowns, catalog=fake_catalog)
     t3 = out["tiers"]["T3"]
     assert t3["eligible_candidates"] == 0
     assert t3["wait_seconds"] == 300
     assert t3["next_available_at"] == (NOW + timedelta(seconds=300)).isoformat().replace("+00:00", "Z")
     assert "back in 300s" in t3["reason"]
     by_model = {c["model"]: c for c in t3["candidates"]}
-    assert by_model["gpt-5.6-sol"]["wait_seconds"] == 300
-    assert by_model["claude-opus-5"]["wait_seconds"] == 11_000
-    assert by_model["grok-4.6"]["wait_seconds"] is None  # missing provider: unknown
+    assert by_model["model-codex-top"]["wait_seconds"] == 300
+    assert by_model["model-c-top"]["wait_seconds"] == 11_000
+    assert by_model["model-g-top"]["wait_seconds"] is None  # missing provider: unknown
     # with something eligible there is no wait
     assert out["tiers"]["T2"]["wait_seconds"] is None
     assert out["tiers"]["T2"]["vendor"] == "agy"
@@ -184,18 +194,16 @@ class _StubRepo:
         return []
 
 
-def _client():
+def _client(catalog: Catalog):
     from app.main import create_app
 
     app: FastAPI = create_app()
     app.router.lifespan_context = _noop_lifespan
+    app.state.catalog = catalog
     app.state.poller = _StubPoller(_all_ok())
     app.state.repository = _StubRepo()
     app.state.routing_feedback = FeedbackRegistry()
     return TestClient(app)
-
-
-from contextlib import asynccontextmanager
 
 
 @asynccontextmanager
@@ -203,12 +211,12 @@ async def _noop_lifespan(app):
     yield
 
 
-def test_feedback_endpoint_round_trip():
-    with _client() as c:
+def test_feedback_endpoint_round_trip(fake_catalog):
+    with _client(fake_catalog) as c:
         before = c.get("/api/routing?tier=T2").json()
         assert before["vendor"] == "codex"
 
-        r = c.post("/api/routing/feedback", json={"model": "gpt-5.6-terra", "status": 429, "error": "rate limit"})
+        r = c.post("/api/routing/feedback", json={"model": "model-codex-mid", "status": 429, "error": "rate limit"})
         assert r.status_code == 200
         assert r.json()["pool"] == "codex"
         assert r.json()["kind"] == "rate_limit"
@@ -216,7 +224,7 @@ def test_feedback_endpoint_round_trip():
 
         after = c.get("/api/routing?tier=T2").json()
         assert after["vendor"] != "codex"
-        assert c.get("/api/routing?model=gpt-5.6-sol").json()["usable"] is False
+        assert c.get("/api/routing?model=model-codex-top").json()["usable"] is False
         state = c.get("/api/routing/feedback").json()
         assert state["pools"]["codex"]["cooling"] is True
 
@@ -225,7 +233,7 @@ def test_feedback_endpoint_round_trip():
         assert filt["vendor"] == "claude"
         assert filt["eligible_candidates"] >= 1
 
-        ok = c.post("/api/routing/feedback", json={"model": "gpt-5.6-terra", "ok": True})
+        ok = c.post("/api/routing/feedback", json={"model": "model-codex-mid", "ok": True})
         assert ok.json()["cooling"] is False
         assert c.get("/api/routing?tier=T2").json()["vendor"] == "codex"
 
@@ -235,3 +243,127 @@ def test_feedback_endpoint_round_trip():
         assert c.post("/api/routing/feedback", json={"pool": "grok", "status": 429}).json()["pool"] == "grok"
         assert c.delete("/api/routing/feedback?pool=grok").json()["cleared"] == "grok"
         assert "grok" not in c.get("/api/routing/feedback").json()["pools"]
+        assert "models" in c.get("/api/routing/feedback").json()
+
+
+def test_registry_model_missing_404(fake_catalog):
+    reg = FeedbackRegistry()
+    t0 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    res = reg.report("codex", ok=False, status=404, model="model-codex-mid", error="not found", now=t0)
+    assert res["kind"] == "model_missing"
+    assert res["cooldown_seconds"] == MODEL_MISSING_SECONDS
+    assert res["cooling"] is False
+    assert res["model"] == "model-codex-mid"
+    assert res["pool"] == "codex"
+
+    # Pool is NOT cooling
+    assert reg.active(now=t0) == {}
+
+    # missing_models contains model-codex-mid
+    missing = reg.missing_models(now=t0)
+    assert "model-codex-mid" in missing
+    assert missing["model-codex-mid"]["missing"] is True
+    assert missing["model-codex-mid"]["seconds_left"] == MODEL_MISSING_SECONDS
+    assert missing["model-codex-mid"]["last_error"] == "not found"
+
+    # Payload integration: model-codex-mid is unusable and missing, other codex models remain usable
+    out = build_routing_payload(
+        _all_ok(),
+        now=t0,
+        cooldowns=reg.active(now=t0),
+        missing_models=reg.missing_models(now=t0),
+        catalog=fake_catalog,
+    )
+    mid = out["models"]["model-codex-mid"]
+    assert mid["missing"] is not None
+    assert mid["usable"] is False
+    top = out["models"]["model-codex-top"]
+    assert top["missing"] is None
+    assert top["usable"] is True
+    assert out["pools"]["codex"]["cooldown"]["cooling"] is False
+
+    # Snapshot includes models block
+    snap = reg.snapshot(now=t0)
+    assert "model-codex-mid" in snap["models"]
+    assert snap["models"]["model-codex-mid"]["missing"] is True
+
+    # Success with same model clears missing state
+    t1 = t0 + timedelta(minutes=5)
+    ok_res = reg.report("codex", ok=True, model="model-codex-mid", now=t1)
+    assert ok_res["cooling"] is False
+    assert reg.missing_models(now=t1) == {}
+    snap_after = reg.snapshot(now=t1)
+    assert snap_after["models"] == {}
+
+
+def test_registry_model_missing_expires_after_24h():
+    reg = FeedbackRegistry()
+    snapshot_reg = FeedbackRegistry()
+    t0 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    reg.report("codex", ok=False, status=404, model="model-codex-mid", now=t0)
+    snapshot_reg.report("codex", ok=False, status=404, model="model-codex-mid", now=t0)
+
+    # After 23 hours: still missing
+    t_23h = t0 + timedelta(hours=23)
+    assert "model-codex-mid" in reg.missing_models(now=t_23h)
+    assert "model-codex-mid" in snapshot_reg.snapshot(now=t_23h)["models"]
+
+    # After 24h + 1s: both views independently prune expired state
+    t_24h = t0 + timedelta(hours=24, seconds=1)
+    assert reg.missing_models(now=t_24h) == {}
+    assert snapshot_reg.snapshot(now=t_24h)["models"] == {}
+
+
+def test_registry_404_without_model_cools_pool():
+    reg = FeedbackRegistry()
+    t0 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    res = reg.report("codex", ok=False, status=404, now=t0)
+    assert res["kind"] == "rejected"
+    assert res["cooldown_seconds"] == COOLDOWN_LONG
+    assert res["cooling"] is True
+    assert "codex" in reg.active(now=t0)
+    assert reg.missing_models(now=t0) == {}
+
+
+def test_feedback_endpoint_model_missing_round_trip(fake_catalog):
+    with _client(fake_catalog) as c:
+        # Initial feedback state has empty models
+        init_state = c.get("/api/routing/feedback").json()
+        assert init_state["models"] == {}
+
+        # Report 404 with model
+        r = c.post(
+            "/api/routing/feedback",
+            json={"model": "model-codex-mid", "ok": False, "status": 404, "error": "model not found"},
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["pool"] == "codex"
+        assert data["kind"] == "model_missing"
+        assert data["cooldown_seconds"] == MODEL_MISSING_SECONDS
+        assert data["cooling"] is False
+        assert data["model"] == "model-codex-mid"
+
+        # GET /api/routing/feedback includes models block with the model
+        fb_state = c.get("/api/routing/feedback").json()
+        assert "models" in fb_state
+        assert "model-codex-mid" in fb_state["models"]
+        assert fb_state["models"]["model-codex-mid"]["missing"] is True
+        assert fb_state["pools"]["codex"]["cooling"] is False
+
+        # GET /api/routing?model=model-codex-mid has usable: false
+        row_mid = c.get("/api/routing?model=model-codex-mid").json()
+        assert row_mid["usable"] is False
+        assert row_mid["missing"] is not None
+
+        # Same pool other model is still usable
+        row_top = c.get("/api/routing?model=model-codex-top").json()
+        assert row_top["usable"] is True
+        assert row_top["missing"] is None
+
+        # Success clears the model missing state
+        r_ok = c.post("/api/routing/feedback", json={"model": "model-codex-mid", "ok": True})
+        assert r_ok.status_code == 200
+        assert c.get("/api/routing?model=model-codex-mid").json()["usable"] is True
+        assert c.get("/api/routing?model=model-codex-mid").json()["missing"] is None
+        assert "model-codex-mid" not in c.get("/api/routing/feedback").json()["models"]

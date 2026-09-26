@@ -3,7 +3,7 @@
 This engine evaluates real-time quota signals against declarative policy rules to
 select the optimal model for a requested tier and role. Operating as a pure function
 without network or filesystem I/O, it maintains identical ranking semantics to the
-legacy routing view (score -> bench -> cost_rank) while enforcing a strict API boundary
+legacy routing view (score -> bench -> blended price) while enforcing a strict API boundary
 that exposes only public vendor/model identifiers and stable reason codes.
 
 Unlike legacy routing_view which falls back to ranked[0] when no candidate is
@@ -41,8 +41,8 @@ class Recommendation:
 
     tier: str
     role: str
-    recommended: dict[str, str] | None
-    alternatives: list[dict[str, str]]
+    recommended: dict[str, str | None] | None
+    alternatives: list[dict[str, str | None]]
     reason_codes: list[str]
     wait_seconds: int | None
 
@@ -112,12 +112,13 @@ def recommend(
     min_score: float | None = None,
     now: datetime | None = None,
     signals_stale: bool = False,
+    model_usable: Mapping[str, bool] | None = None,
 ) -> Recommendation:
     """Select the best candidate model according to quota signals and policy.
 
     The ranking key mirrors legacy routing: eligible models sort first, followed by
     usable status, descending live quota score, descending benchmark capability, and
-    ascending cost rank. Unlike legacy routing_view which falls back to ranked[0],
+    ascending blended price. Unlike legacy routing_view which falls back to ranked[0],
     this function sets recommended to None when no candidate is eligible to enable
     clean client-side static fallbacks.
 
@@ -132,17 +133,13 @@ def recommend(
             m for m, spec in policy.models.items() if spec.reviewer
         ]
     elif role == "orchestrate":
-        # Orchestrators permit dispatchable=False models (e.g. planner-dedicated fable)
-        # while honoring explicit vendor exclusions from policy.
-        excluded_vendors = set(policy.orchestrator_excluded_vendors)
         candidates = [
             m
             for m, spec in policy.models.items()
-            if spec.role == "orchestrator"
-            and _model_vendor(spec.pool) not in excluded_vendors
+            if spec.orchestrator
         ]
     else:
-        # Implementation tasks require dispatchable models whose max_tier covers tier.
+        # Implementation tasks require dispatchable models whose derived tier range includes tier.
         candidates = policy.tier_candidates(tier)
 
     # 2. Extract per-candidate sanitized metrics from pool signals.
@@ -168,6 +165,9 @@ def recommend(
             level = str(sig.get("level", "unknown"))
             cooling = bool(sig.get("cooling", False))
             stale = bool(sig.get("stale", False))
+
+        if model_usable is not None and model_usable.get(m) is False:
+            usable = False
 
         eligible = _is_candidate_eligible(
             usable=usable,
@@ -204,7 +204,7 @@ def recommend(
                 else -1.0
             ),
             -candidate_data[m]["spec"].bench,
-            candidate_data[m]["spec"].cost_rank,
+            candidate_data[m]["spec"].blended_price,
         ),
     )
 
@@ -213,14 +213,16 @@ def recommend(
     # 4. Determine recommendation and alternatives (maximum 3 runners-up).
     if eligible_models:
         top_model: str | None = eligible_models[0]
-        recommended: dict[str, str] | None = {
+        recommended: dict[str, str | None] | None = {
             "vendor": candidate_data[top_model]["vendor"],
             "model": top_model,
+            "effort": candidate_data[top_model]["spec"].effort,
         }
         alternatives = [
             {
                 "vendor": candidate_data[m]["vendor"],
                 "model": m,
+                "effort": candidate_data[m]["spec"].effort,
             }
             for m in eligible_models[1:4]
         ]
@@ -245,6 +247,7 @@ def recommend(
         top_info is not None
         and tier in policy.tiers
         and top_info["spec"].max_tier >= policy.tiers[tier].level
+        and (role != "implement" or tier in top_info["spec"].tiers)
     ):
         reason_codes.append("tier_capable")
 

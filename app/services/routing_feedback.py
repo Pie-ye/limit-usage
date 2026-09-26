@@ -16,6 +16,9 @@ the next success. This module is the same idea per vendor pool:
 * ``FeedbackRegistry.active(now)`` is what ``build_routing_payload`` folds into
   ``usable`` / ``next_available_at``.
 
+A 404 failure with a specified model represents a single model missing/delisted,
+cooldown for that model only (24 hours), separate from vendor pool cooldown.
+
 State is in-memory (as in 9router); a restart clears it, which is the safe
 direction — the poller's remaining % is still the primary signal.
 """
@@ -34,6 +37,8 @@ BACKOFF_BASE_SECONDS = 60
 BACKOFF_MAX_LEVEL = 8
 # Hard cap on any cooldown, including a provider-reported retry-after.
 MAX_COOLDOWN_SECONDS = 30 * 60
+# Model missing / delisted cooldown (24 hours).
+MODEL_MISSING_SECONDS = 24 * 3600
 # Fixed cooldowns (seconds).
 COOLDOWN_LONG = 5 * 60       # auth / billing / not-found: needs a human or a re-login
 COOLDOWN_SHORT = 5           # request rejected as malformed: try the next model
@@ -137,6 +142,27 @@ class PoolState:
         }
 
 
+@dataclass
+class ModelState:
+    missing_until: datetime | None = None
+    last_error: str | None = None
+    reported_at: datetime | None = None
+
+    def missing(self, now: datetime) -> bool:
+        return self.missing_until is not None and _as_utc(self.missing_until) > _as_utc(now)
+
+    def view(self, now: datetime) -> dict[str, Any]:
+        missing = self.missing(now)
+        left = int((_as_utc(self.missing_until) - _as_utc(now)).total_seconds()) if missing else 0
+        return {
+            "missing": missing,
+            "until": _iso(self.missing_until) if missing else None,
+            "seconds_left": left,
+            "last_error": self.last_error,
+            "reported_at": _iso(self.reported_at),
+        }
+
+
 HISTORY_LIMIT = 20
 
 
@@ -146,6 +172,7 @@ class FeedbackRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._pools: dict[str, PoolState] = {}
+        self._models: dict[str, ModelState] = {}
 
     def report(
         self,
@@ -159,9 +186,12 @@ class FeedbackRegistry:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         current = _as_utc(now or utcnow())
+        model_missing = not ok and status == 404 and bool(model)
         with self._lock:
             state = self._pools.setdefault(pool, PoolState())
             if ok:
+                if model:
+                    self._models.pop(model, None)
                 # 9router resetAccountState: one success clears cooldown + backoff.
                 state.unavailable_until = None
                 state.backoff_level = 0
@@ -170,6 +200,23 @@ class FeedbackRegistry:
                 state.last_model = model or state.last_model
                 state.successes += 1
                 decision = {"kind": "ok", "cooldown_seconds": 0, "backoff_level": 0}
+            elif model_missing:
+                assert model is not None
+                m_state = self._models.setdefault(model, ModelState())
+                m_state.missing_until = current + timedelta(seconds=MODEL_MISSING_SECONDS)
+                m_state.last_error = (error or "")[:500] or None
+                m_state.reported_at = current
+
+                state.last_error = (error or "")[:500] or None
+                state.last_model = model or state.last_model
+                state.last_failure_at = current
+                state.failures += 1
+
+                decision = {
+                    "kind": "model_missing",
+                    "cooldown_seconds": MODEL_MISSING_SECONDS,
+                    "backoff_level": state.backoff_level,
+                }
             else:
                 decision = classify(status, error, backoff_level=state.backoff_level)
                 cooldown = decision["cooldown_seconds"]
@@ -198,7 +245,15 @@ class FeedbackRegistry:
                 }
             )
             del state.history[:-HISTORY_LIMIT]
-            return {"pool": pool, **state.view(current), **decision}
+            out = {"pool": pool, **state.view(current), **decision}
+            if model_missing:
+                out["model"] = model
+            return out
+
+    def _prune_expired_models(self, now: datetime) -> None:
+        expired = [model for model, state in self._models.items() if not state.missing(now)]
+        for model in expired:
+            del self._models[model]
 
     def active(self, now: datetime | None = None) -> dict[str, dict[str, Any]]:
         """Pools currently cooling → their view. Expired entries are dropped."""
@@ -206,17 +261,27 @@ class FeedbackRegistry:
         with self._lock:
             return {p: s.view(current) for p, s in self._pools.items() if s.cooling(current)}
 
+    def missing_models(self, now: datetime | None = None) -> dict[str, dict[str, Any]]:
+        """Currently missing models → their view. Expired entries are pruned."""
+        current = _as_utc(now or utcnow())
+        with self._lock:
+            self._prune_expired_models(current)
+            return {m: s.view(current) for m, s in self._models.items()}
+
     def snapshot(self, now: datetime | None = None) -> dict[str, Any]:
         current = _as_utc(now or utcnow())
         with self._lock:
+            self._prune_expired_models(current)
             return {
                 "server_time": _iso(current),
                 "pools": {p: {**s.view(current), "history": list(s.history)} for p, s in self._pools.items()},
+                "models": {m: s.view(current) for m, s in self._models.items()},
             }
 
     def clear(self, pool: str | None = None) -> None:
         with self._lock:
             if pool is None:
                 self._pools.clear()
+                self._models.clear()
             else:
                 self._pools.pop(pool, None)

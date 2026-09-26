@@ -1,0 +1,12 @@
+# Tier formula parameters. See catalog/tiering.py for how they are applied.
+# blended price = (input*blend.input + output*blend.output) / (blend.input + blend.output)
+# max_tier = highest tier whose min_bench <= bench
+# min_tier = lowest tier whose max_blended_price is null or >= blended price
+schema_version: 1
+blend: {input: 1, output: 3}
+tiers:
+  T0: {min_bench: 0, max_blended_price: 5}
+  T1: {min_bench: 60, max_blended_price: 10}
+  T2: {min_bench: 74, max_blended_price: 25}
+  T3: {min_bench: 86, max_blended_price: null}
+orchestrator_excluded_vendors: [agy]

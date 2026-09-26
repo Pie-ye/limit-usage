@@ -1,15 +1,8 @@
-"""Prove the declarative policy remains identical to the legacy constants.
-
-The parity assertions protect this extraction from silently changing dispatch
-behavior, while malformed copies exercise startup failures without touching the
-version-controlled policy files or requiring any network access.
-"""
+"""Tests for loading routing policy rules with the shared model catalog."""
 
 from __future__ import annotations
 
 import shutil
-import sys
-import types
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -17,57 +10,67 @@ from typing import Any
 import pytest
 import yaml
 
+from app.policy import Policy, load_policy
+
 ROUTING_POLICY_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROUTING_POLICY_ROOT))
-
-from app.policy import Policy, load_policy  # noqa: E402
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-# ``app.policy`` and the legacy ``app.services`` live in separate source roots
-# during the extraction. Extending the already-imported package lets the parity
-# test exercise both without changing either application's packaging contract.
-import app as routing_policy_app  # noqa: E402
-
-LEGACY_APP_PATH = Path(__file__).resolve().parents[2] / "app"
-if str(LEGACY_APP_PATH) not in routing_policy_app.__path__:
-    routing_policy_app.__path__.append(str(LEGACY_APP_PATH))
-
-# The legacy package initializer imports the poller and database even though
-# parity only needs the pure routing module. A package shim keeps this focused
-# test independent of optional SQLite support in the Python runtime.
-legacy_services = types.ModuleType("app.services")
-legacy_services.__path__ = [str(LEGACY_APP_PATH / "services")]
-sys.modules["app.services"] = legacy_services
-
-from app.services.routing_view import (  # noqa: E402
-    MODELS,
-    POOLS,
-    TIER_LEVELS,
-    tier_candidates,
-)
-
+REPO_ROOT = ROUTING_POLICY_ROOT.parent
 POLICY_DIR = ROUTING_POLICY_ROOT / "policy"
 
 
 @pytest.fixture
-def policy() -> Policy:
+def policy(monkeypatch: pytest.MonkeyPatch) -> Policy:
+    monkeypatch.delenv("CATALOG_DIR", raising=False)
     return load_policy(POLICY_DIR)
 
 
 @pytest.fixture
-def mutable_policy_dir(tmp_path: Path) -> Path:
-    target = tmp_path / "policy"
-    shutil.copytree(POLICY_DIR, target)
-    return target
+def synthetic_policy_and_catalog(tmp_path: Path) -> tuple[Path, Path]:
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir()
+    shutil.copy(POLICY_DIR / "tiers.yaml", policy_dir / "tiers.yaml")
+    shutil.copy(POLICY_DIR / "roles.yaml", policy_dir / "roles.yaml")
+
+    catalog_dir = tmp_path / "catalog"
+    catalog_dir.mkdir()
+    shutil.copy(REPO_ROOT / "catalog" / "tiering.yaml", catalog_dir / "tiering.yaml")
+    models = {
+        "schema_version": 2,
+        "catalog_version": "test-catalog.1",
+        "pools": {
+            "codex": {
+                "provider": "codex",
+                "display_name": "Test Codex",
+                "slots": {"5h": "5h", "1w": "1w"},
+            }
+        },
+        "models": {
+            "model-test": {
+                "pool": "codex",
+                "slots": ["5h", "1w"],
+                "bench": 90,
+                "price": {
+                    "input": 1.0,
+                    "output": 2.0,
+                    "as_of": "2026-09-26",
+                    "source": "https://example.test/pricing",
+                },
+                "effort": "high",
+            }
+        },
+    }
+    (catalog_dir / "models.yaml").write_text(
+        yaml.safe_dump(models, sort_keys=False),
+        encoding="utf-8",
+    )
+    return policy_dir, catalog_dir
 
 
 def _change_document(
-    policy_dir: Path,
+    directory: Path,
     filename: str,
     change: Callable[[dict[str, Any]], None],
 ) -> None:
-    path = policy_dir / filename
+    path = directory / filename
     document = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert isinstance(document, dict)
     change(document)
@@ -83,89 +86,147 @@ def _assert_error_has(error: pytest.ExceptionInfo[ValueError], *parts: str) -> N
         assert part in message
 
 
-def test_policy_metadata(policy: Policy) -> None:
+def test_policy_metadata_and_real_catalog(policy: Policy) -> None:
     assert policy.schema_version == 1
-    assert policy.policy_version == "2026-09-15.1"
+    assert policy.policy_version == "2026-09-26.1"
+    assert policy.catalog_version == "2026-09-26.1"
     assert policy.review_cross_vendor is True
     assert policy.ranking == ["availability", "quota", "capability", "cost"]
-    assert policy.orchestrator_excluded_vendors == ["agy"]
+    assert policy.tier_candidates("T3") == [
+        "grok-4.6",
+        "gpt-5.6-sol",
+        "claude-opus-5",
+    ]
+    assert all(
+        "gpt-5.5" not in policy.tier_candidates(tier)
+        for tier in ("T0", "T1", "T2", "T3")
+    )
+    assert policy.models["claude-fable-5-1"].dispatchable is False
 
 
-def test_policy_matches_legacy_routing_constants(policy: Policy) -> None:
-    assert set(policy.pools) == set(POOLS)
-    for pool_id, legacy_pool in POOLS.items():
-        loaded_pool = policy.pools[pool_id]
-        assert loaded_pool.provider == legacy_pool["provider"].value
-        assert loaded_pool.display_name == legacy_pool["display_name"]
-        assert loaded_pool.slots == legacy_pool["slots"]
-
-    assert set(policy.models) == set(MODELS)
-    for model_id, legacy_model in MODELS.items():
-        loaded_model = policy.models[model_id]
-        assert loaded_model.pool == legacy_model["pool"]
-        assert loaded_model.slots == legacy_model["slots"]
-        assert loaded_model.max_tier == legacy_model["max_tier"]
-        assert loaded_model.bench == legacy_model["bench"]
-        assert loaded_model.cost_rank == legacy_model["cost_rank"]
-        assert loaded_model.role == legacy_model["role"]
-        assert loaded_model.reviewer == legacy_model.get("reviewer", False)
-        assert loaded_model.dispatchable == legacy_model.get("dispatchable", True)
-
-    assert {tier_id: tier.level for tier_id, tier in policy.tiers.items()} == TIER_LEVELS
-    for tier_id in ("T0", "T1", "T2", "T3", "review"):
-        assert policy.tier_candidates(tier_id) == tier_candidates(tier_id)
+def test_tier_candidates_rejects_unknown_tier(policy: Policy) -> None:
+    with pytest.raises(KeyError) as error:
+        policy.tier_candidates("T9")
+    assert error.value.args == ("T9",)
 
 
-def test_rejects_unknown_pool_reference(mutable_policy_dir: Path) -> None:
+def test_model_min_tier_conversion(
+    policy: Policy,
+    synthetic_policy_and_catalog: tuple[Path, Path],
+) -> None:
+    assert policy.models["gemini-3.1-pro-low"].min_tier == 1
+    assert policy.models["gpt-5.5"].min_tier == 2
+    assert policy.models["gpt-5.5"].tiers == []
+
+    policy_dir, catalog_dir = synthetic_policy_and_catalog
+
+    def cap_t3_price(document: dict[str, Any]) -> None:
+        document["tiers"]["T3"]["max_blended_price"] = 50
+
+    def exceed_all_price_caps(document: dict[str, Any]) -> None:
+        document["models"]["model-test"]["price"]["input"] = 51.0
+        document["models"]["model-test"]["price"]["output"] = 51.0
+
+    _change_document(catalog_dir, "tiering.yaml", cap_t3_price)
+    _change_document(catalog_dir, "models.yaml", exceed_all_price_caps)
+
+    no_minimum = load_policy(policy_dir, catalog_dir=catalog_dir)
+    assert no_minimum.models["model-test"].min_tier is None
+    assert no_minimum.models["model-test"].tiers == []
+
+
+def test_rejects_unknown_pool_reference(
+    synthetic_policy_and_catalog: tuple[Path, Path],
+) -> None:
+    policy_dir, catalog_dir = synthetic_policy_and_catalog
+
     def change(document: dict[str, Any]) -> None:
-        document["models"]["gpt-reserve"]["pool"] = "missing-pool"
+        document["models"]["model-test"]["pool"] = "missing-pool"
 
-    _change_document(mutable_policy_dir, "models.yaml", change)
+    _change_document(catalog_dir, "models.yaml", change)
 
     with pytest.raises(ValueError) as error:
-        load_policy(mutable_policy_dir)
-    _assert_error_has(error, "models.yaml", "gpt-reserve", "pool")
+        load_policy(policy_dir, catalog_dir=catalog_dir)
+    _assert_error_has(error, "models.yaml", "models.model-test.pool")
 
 
-def test_rejects_max_tier_outside_supported_range(mutable_policy_dir: Path) -> None:
+def test_rejects_bench_outside_supported_range(
+    synthetic_policy_and_catalog: tuple[Path, Path],
+) -> None:
+    policy_dir, catalog_dir = synthetic_policy_and_catalog
+
     def change(document: dict[str, Any]) -> None:
-        document["models"]["gpt-reserve"]["max_tier"] = 4
+        document["models"]["model-test"]["bench"] = 101
 
-    _change_document(mutable_policy_dir, "models.yaml", change)
+    _change_document(catalog_dir, "models.yaml", change)
 
     with pytest.raises(ValueError) as error:
-        load_policy(mutable_policy_dir)
-    _assert_error_has(error, "models.yaml", "gpt-reserve", "max_tier")
+        load_policy(policy_dir, catalog_dir=catalog_dir)
+    _assert_error_has(error, "models.yaml", "models.model-test.bench")
 
 
-def test_rejects_missing_required_model_field(mutable_policy_dir: Path) -> None:
+def test_rejects_model_slot_missing_from_pool(
+    synthetic_policy_and_catalog: tuple[Path, Path],
+) -> None:
+    policy_dir, catalog_dir = synthetic_policy_and_catalog
+
     def change(document: dict[str, Any]) -> None:
-        del document["models"]["gpt-reserve"]["bench"]
+        document["models"]["model-test"]["slots"].append("missing-slot")
 
-    _change_document(mutable_policy_dir, "models.yaml", change)
+    _change_document(catalog_dir, "models.yaml", change)
 
     with pytest.raises(ValueError) as error:
-        load_policy(mutable_policy_dir)
-    _assert_error_has(error, "models.yaml", "gpt-reserve", "bench")
+        load_policy(policy_dir, catalog_dir=catalog_dir)
+    _assert_error_has(
+        error,
+        "models.yaml",
+        "models.model-test.slots",
+        "missing-slot",
+    )
 
 
-def test_rejects_unsupported_schema_version(mutable_policy_dir: Path) -> None:
+def test_rejects_missing_required_model_field(
+    synthetic_policy_and_catalog: tuple[Path, Path],
+) -> None:
+    policy_dir, catalog_dir = synthetic_policy_and_catalog
+
+    def change(document: dict[str, Any]) -> None:
+        del document["models"]["model-test"]["bench"]
+
+    _change_document(catalog_dir, "models.yaml", change)
+
+    with pytest.raises(ValueError) as error:
+        load_policy(policy_dir, catalog_dir=catalog_dir)
+    _assert_error_has(error, "models.yaml", "models.model-test.bench")
+
+
+def test_rejects_unsupported_roles_schema_version(
+    synthetic_policy_and_catalog: tuple[Path, Path],
+) -> None:
+    policy_dir, catalog_dir = synthetic_policy_and_catalog
+
     def change(document: dict[str, Any]) -> None:
         document["schema_version"] = 2
 
-    _change_document(mutable_policy_dir, "roles.yaml", change)
+    _change_document(policy_dir, "roles.yaml", change)
 
     with pytest.raises(ValueError) as error:
-        load_policy(mutable_policy_dir)
+        load_policy(policy_dir, catalog_dir=catalog_dir)
     _assert_error_has(error, "roles.yaml", "schema_version")
 
 
-def test_rejects_model_slot_missing_from_pool(mutable_policy_dir: Path) -> None:
-    def change(document: dict[str, Any]) -> None:
-        document["models"]["gpt-reserve"]["slots"].append("1w-fable")
+def test_rejects_policy_tier_set_that_differs_from_catalog(
+    synthetic_policy_and_catalog: tuple[Path, Path],
+) -> None:
+    policy_dir, catalog_dir = synthetic_policy_and_catalog
 
-    _change_document(mutable_policy_dir, "models.yaml", change)
+    def change(document: dict[str, Any]) -> None:
+        del document["tiers"]["T3"]
+
+    _change_document(policy_dir, "tiers.yaml", change)
 
     with pytest.raises(ValueError) as error:
-        load_policy(mutable_policy_dir)
-    _assert_error_has(error, "models.yaml", "gpt-reserve", "slots", "1w-fable")
+        load_policy(policy_dir, catalog_dir=catalog_dir)
+    assert str(error.value) == (
+        "tiers.yaml: tiers: must define exactly T0, T1, T2, T3"
+    )

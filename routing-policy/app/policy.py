@@ -1,9 +1,7 @@
-"""Load and validate the version-controlled routing policy.
+"""Load and assemble the version-controlled routing policy.
 
-The policy is split by concern so model inventory, tier boundaries, and routing
-roles can be reviewed independently.  This module validates each source before
-assembling one typed object, keeping configuration errors close to the filename
-and key that caused them while preserving the legacy candidate ordering.
+Models and their derived capabilities come from the shared catalog. This module
+only validates tier boundaries and role rules before assembling one typed policy.
 """
 
 from __future__ import annotations
@@ -13,6 +11,8 @@ from typing import Any, Literal, TypeVar
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from catalog.tiering import load_catalog
 
 
 class _PolicyModel(BaseModel):
@@ -30,15 +30,19 @@ class Pool(_PolicyModel):
 
 
 class Model(_PolicyModel):
-    """Describe the static routing capabilities of one model."""
+    """Describe the catalog-derived routing capabilities of one model."""
 
     pool: str
     slots: list[str]
-    max_tier: int = Field(ge=0, le=3)
     bench: int
-    cost_rank: int
+    blended_price: float
+    effort: str | None = None
+    min_tier: int | None = Field(default=None, ge=0, le=3)
+    max_tier: int = Field(ge=0, le=3)
+    tiers: list[str]
     role: Literal["orchestrator", "subagent"]
     reviewer: bool = False
+    orchestrator: bool = False
     dispatchable: bool = True
 
 
@@ -50,10 +54,11 @@ class Tier(_PolicyModel):
 
 
 class Policy(_PolicyModel):
-    """Provide the merged policy and the legacy-compatible candidate query."""
+    """Provide the assembled routing policy and candidate query."""
 
     schema_version: Literal[1]
     policy_version: str
+    catalog_version: str
     pools: dict[str, Pool]
     models: dict[str, Model]
     tiers: dict[str, Tier]
@@ -68,10 +73,12 @@ class Policy(_PolicyModel):
             "with legacy routing_view; changing the evaluation sequence requires modifying engine.py."
         )
     )
-    orchestrator_excluded_vendors: list[str]
 
     def tier_candidates(self, tier_id: str) -> list[str]:
-        """Return eligible model ids in the legacy cost-rank order."""
+        """Return eligible model ids ordered by blended price and model id."""
+
+        if tier_id != "review" and tier_id not in self.tiers:
+            raise KeyError(tier_id)
 
         if tier_id == "review":
             candidates = [
@@ -80,22 +87,18 @@ class Policy(_PolicyModel):
                 if specification.reviewer
             ]
         else:
-            level = self.tiers[tier_id].level
             candidates = [
                 model_id
                 for model_id, specification in self.models.items()
-                if specification.max_tier >= level and specification.dispatchable
+                if specification.dispatchable and tier_id in specification.tiers
             ]
         return sorted(
             candidates,
-            key=lambda model_id: self.models[model_id].cost_rank,
+            key=lambda model_id: (
+                self.models[model_id].blended_price,
+                model_id,
+            ),
         )
-
-
-class _ModelsDocument(_PolicyModel):
-    schema_version: Literal[1]
-    pools: dict[str, Pool]
-    models: dict[str, Model]
 
 
 class _ReviewTier(_PolicyModel):
@@ -117,15 +120,10 @@ class _RolePolicy(_PolicyModel):
     review: _ReviewPolicy
 
 
-class _OrchestratorPolicy(_PolicyModel):
-    excluded_vendors: list[str]
-
-
 class _RolesDocument(_PolicyModel):
     schema_version: Literal[1]
     policy: _RolePolicy
     ranking: list[str]
-    orchestrator: _OrchestratorPolicy
 
 
 Document = TypeVar("Document", bound=_PolicyModel)
@@ -160,36 +158,16 @@ def _validate_document(
         raise ValueError("; ".join(details)) from error
 
 
-def _validate_model_references(models_document: _ModelsDocument) -> None:
-    for model_id, specification in models_document.models.items():
-        pool = models_document.pools.get(specification.pool)
-        if pool is None:
-            raise ValueError(
-                f"models.yaml: models.{model_id}.pool: "
-                f"unknown pool {specification.pool!r}"
-            )
-
-        for slot in specification.slots:
-            if slot not in pool.slots:
-                raise ValueError(
-                    f"models.yaml: models.{model_id}.slots: slot {slot!r} "
-                    f"is not defined by pool {specification.pool!r}"
-                )
-
-
-def load_policy(policy_dir: Path | str) -> Policy:
-    """Read the three YAML documents and return one validated policy object."""
+def load_policy(
+    policy_dir: Path | str,
+    catalog_dir: Path | str | None = None,
+) -> Policy:
+    """Read policy rules and the shared catalog into one validated object."""
 
     directory = Path(policy_dir)
-    models_path = directory / "models.yaml"
     tiers_path = directory / "tiers.yaml"
     roles_path = directory / "roles.yaml"
 
-    models_document = _validate_document(
-        _ModelsDocument,
-        _read_yaml(models_path),
-        models_path,
-    )
     tiers_document = _validate_document(
         _TiersDocument,
         _read_yaml(tiers_path),
@@ -200,17 +178,46 @@ def load_policy(policy_dir: Path | str) -> Policy:
         _read_yaml(roles_path),
         roles_path,
     )
-    _validate_model_references(models_document)
+    catalog = load_catalog(catalog_dir)
+
+    if set(tiers_document.tiers) != set(catalog.tier_ids):
+        raise ValueError(
+            "tiers.yaml: tiers: must define exactly T0, T1, T2, T3"
+        )
+
+    pools = {
+        pool_id: Pool.model_validate(specification)
+        for pool_id, specification in catalog.pools.items()
+    }
+    models = {
+        model_id: Model(
+            pool=derived.pool,
+            slots=list(derived.slots),
+            bench=derived.bench,
+            blended_price=derived.blended_price,
+            effort=derived.effort,
+            min_tier=(
+                int(derived.min_tier[1:])
+                if derived.min_tier is not None
+                else None
+            ),
+            max_tier=int(derived.max_tier[1:]),
+            tiers=list(derived.tiers),
+            role=derived.role,
+            reviewer=derived.reviewer,
+            orchestrator=derived.orchestrator,
+            dispatchable=derived.dispatchable,
+        )
+        for model_id, derived in catalog.models.items()
+    }
 
     return Policy(
-        schema_version=models_document.schema_version,
+        schema_version=tiers_document.schema_version,
         policy_version=tiers_document.policy_version,
-        pools=models_document.pools,
-        models=models_document.models,
+        catalog_version=catalog.catalog_version,
+        pools=pools,
+        models=models,
         tiers=tiers_document.tiers,
         review_cross_vendor=roles_document.policy.review.cross_vendor,
         ranking=roles_document.ranking,
-        orchestrator_excluded_vendors=(
-            roles_document.orchestrator.excluded_vendors
-        ),
     )
