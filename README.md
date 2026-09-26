@@ -163,6 +163,7 @@ Infisical folder `/limit-usage` 只有一個密鑰名 `DEEPSEEK_API_KEY`。其�
 | `CLAUDE_CREDENTIALS_PATH` | `~/.claude/.credentials.json` | OAuth fallback 與 tier 提示 |
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | 只看 mtime |
 | `DATABASE_PATH` | `./data/usage.db` | SQLite |
+| `CLI_MODELS_PATH` | `./data/cli-models.json` | 主機端 `deploy/cli-models-export.py` 匯出的 CLI 可用模型清單；compose 設為 `/app/data/cli-models.json`。缺失、損毀或超過 48 小時只會讓 `listed` 為 `null`，不影響啟動 |
 
 `.env.example` 只列名稱，不是運行時來源。
 
@@ -334,7 +335,7 @@ curl -X DELETE 'http://127.0.0.1:50048/api/routing/feedback?pool=codex'
 錯誤分類規則（`app/services/routing_feedback.py` `ERROR_RULES`）：若 `status == 404` 且帶 `model`，即 `{"model":"<id>","status":404,...}` → 只把該模型標為下架 24 小時（`kind: "model_missing"`），不動 pool；同一模型回報成功即清除；`GET /api/routing/feedback` 的 `models` 區塊可查。若 404 未帶 `model` 則退回一般 pool 錯誤（冷卻 5 分鐘）。其他錯誤先依文字、再依 status 分類：限流字樣或 429 → 指數退避 60s、120s、240s…；login／401／402／403 → 5 分鐘；格式錯誤 → 5s；其餘 → 30s。`retry_after_seconds` 優先於算出的冷卻。全部上限 30 分鐘（不能把 pool 鎖到五小時後的 `resets_at`）。較輕的後續回報不會縮短進行中的冷卻。狀態在記憶體；重啟即清。
 
 **模型目錄與能力推導（`catalog/`）。** 所有模型資料與能力推導已統一移至 repo 根目錄的 `catalog/`，由 `limit-usage` 與 `routing-policy` 共用，改動後兩個 image 都要重建（`docker compose build limit-usage routing-policy && docker compose up -d`）：
-- `catalog/models.yaml`：宣告各 CLI vendor pool 及每個模型的 `pool`、`slots`、`bench`（coding benchmark 指數）、`bench_note`、`price`（API 牌價 `input`／`output`、`as_of`、`source`、選填 `proxy_of`）、`effort`（推理強度）、`dispatchable`（預設 true）。
+- `catalog/models.yaml`：宣告各 CLI vendor pool 及每個模型的 `pool`、`slots`、`bench`（coding benchmark 指數）、`bench_note`、`price`（API 牌價 `input`／`output`、`as_of`、`source`、選填 `proxy_of`：借用哪個模型的牌價，被指向的模型須存在且 `input`／`output` 須與其相同）、`effort`（推理強度）、`dispatchable`（預設 true）。
   - `dispatchable: false` 的意義：例如 `claude-fable-5-1` 另外綁 Fable 週上限，會出現在視窗追蹤與編排者候選中，但永不當作派工候選（避免消耗主 session 規劃者的週配額）。
 - `catalog/tiering.yaml` 與推導公式（`catalog/tiering.py`）：
   - 混合牌價：`blended_price = (1 * input + 3 * output) / 4`（依 1:3 加權四捨五入至小數 4 位）。
@@ -349,7 +350,7 @@ curl -X DELETE 'http://127.0.0.1:50048/api/routing/feedback?pool=codex'
   - `orchestrator_excluded_vendors: [agy]`（排除 Antigravity 擔任編排者）。
   - 審查者（`reviewer`）：區間含 T3 且 `dispatchable` 為 true。
   - 編排者（`orchestrator`）：最高 Tier 為 T3 且非排除廠商。
-- 更新維護：更新牌價或 benchmark 時只改 `models.yaml` 並 bump `catalog_version`。若 CLI 清單匯出偵測到新模型出現在 `catalog.uncatalogued`，應補進 `catalog/models.yaml`。
+- 更新維護：更新牌價或 benchmark 時只改 `models.yaml` 並 bump `catalog_version`。catalog 驗證失敗（未知 key、門檻非遞增、`proxy_of` 價格不一致等）會讓 limit-usage 與 routing-policy 在啟動時直接失敗，訊息含檔名與 key 路徑。若 CLI 清單匯出偵測到新模型出現在 `catalog.uncatalogued`，應補進 `catalog/models.yaml`。
 - 查詢過濾：`?model=<id>` 回單一模型狀態，`?tier=T2` 回單一 tier 推薦與候選。跨廠商 review 規則由呼叫端或 routing-policy 套用。
 
 `dispatch` 的 shell recipe：
@@ -389,14 +390,14 @@ Trellis：`orchestrating-development/scripts/route --tier T2 --format trellis` �
 
 ## 測試
 
-主專案 pytest（`pytest.ini`：`asyncio_mode=auto`、`testpaths=tests`），22 個檔案、214 個測試。HTTP 用 respx mock。與 Homepage 的 `system_health` 有 parity 測試（`test_parity_with_homepage_contract`）。
+主專案 pytest（`pytest.ini`：`asyncio_mode=auto`、`testpaths=tests`），23 個檔案、217 個測試。HTTP 用 respx mock。與 Homepage 的 `system_health` 有 parity 測試（`test_parity_with_homepage_contract`）。
 
 ```bash
 cd /home/pieye/Container/limit-usage
 .venv/bin/pytest tests/ -q
 ```
 
-routing-policy：4 檔、50 個測試。
+routing-policy：4 檔、52 個測試。
 
 ```bash
 cd routing-policy && ../.venv/bin/python -m pytest tests/ -v

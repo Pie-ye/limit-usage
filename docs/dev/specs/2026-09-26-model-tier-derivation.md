@@ -188,7 +188,7 @@ def tier_candidates(catalog: Catalog, tier: str) -> list[str]
 
 ### limit-usage 讀取
 
-- 路徑：設定 `cli_models_path`（env `CLI_MODELS_PATH`，預設 `/app/data/cli-models.json`）；依 mtime 快取
+- 路徑：設定 `cli_models_path`（env `CLI_MODELS_PATH`，預設 `/app/data/cli-models.json`；審查後決定 `config.py` 預設維持 `./data/cli-models.json`，由 docker-compose 設 `/app/data/cli-models.json`）；依 mtime 快取
 - 某廠商清單「有效」= 檔案存在、可解析、`generated_at` 距今 ≤ 48 小時、該廠商 `ok: true`
 - 每個模型 `listed`：廠商清單有效時為 `true`／`false`，否則 `null`
 - `listed == false` → 該模型 `usable = false`
