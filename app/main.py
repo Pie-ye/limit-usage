@@ -18,6 +18,7 @@ from app.providers.registry import build_providers
 from app.services.poller import UsagePoller
 from app.services.remote_claude import RemoteClaudeRegistry
 from app.services.routing_feedback import FeedbackRegistry
+from catalog.tiering import Catalog, load_catalog
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +57,7 @@ class ClaudeIngest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    catalog = load_catalog()
     settings = get_settings()
     repo = Repository(settings.db_path)
     remote_claude = RemoteClaudeRegistry()
@@ -67,6 +69,7 @@ async def lifespan(app: FastAPI):
         max_backoff_seconds=settings.max_backoff_seconds,
         refresh_min_interval_seconds=settings.refresh_min_interval_seconds,
     )
+    app.state.catalog = catalog
     app.state.settings = settings
     app.state.repository = repo
     app.state.poller = poller
@@ -74,10 +77,11 @@ async def lifespan(app: FastAPI):
     app.state.remote_claude = remote_claude
     poller.start()
     logger.info(
-        "limit-usage v%s listening config port=%s db=%s",
+        "limit-usage v%s listening config port=%s db=%s catalog=%s",
         __version__,
         settings.port,
         settings.db_path,
+        catalog.catalog_version,
     )
     yield
     await poller.stop()
@@ -245,6 +249,7 @@ def create_app() -> FastAPI:
             avoid_vendor=avoid_vendor,
             vendors=vendors,
             min_score=min_score,
+            catalog=request.app.state.catalog,
         )
 
     @api.get("/routing")
@@ -299,15 +304,14 @@ def create_app() -> FastAPI:
         """
         from fastapi import HTTPException
 
-        from app.services.routing_view import CATALOG
-
+        catalog: Catalog = request.app.state.catalog
         pool = body.pool
         if body.model:
-            derived = CATALOG.models.get(body.model)
+            derived = catalog.models.get(body.model)
             if derived is None:
                 raise HTTPException(status_code=404, detail=f"Unknown model: {body.model}")
             pool = derived.pool
-        elif pool and pool not in CATALOG.pools:
+        elif pool and pool not in catalog.pools:
             raise HTTPException(status_code=404, detail=f"Unknown pool: {pool}")
         if not pool:
             raise HTTPException(status_code=422, detail="model or pool is required")

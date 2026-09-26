@@ -64,7 +64,6 @@ from app.services.cli_models import CliModels
 from catalog.tiering import (
     Catalog,
     Derived,
-    load_catalog,
     tier_candidates as catalog_tier_candidates,
 )
 
@@ -80,8 +79,6 @@ PACE_PENALTY = 0.5
 LOOKBACK_HOURS = {"5h": 2.0, "1w": 24.0, "1w-fable": 24.0}
 # Below this %/hour the pool is considered idle (mirrors analytics ``idle``).
 IDLE_BURN_PER_HOUR = 0.05
-
-CATALOG = load_catalog()
 
 
 def _tier_int(tier_str: str | None) -> int | None:
@@ -253,9 +250,9 @@ def build_routing_payload(
     avoid_vendor: str | None = None,
     vendors: Iterable[str] | None = None,
     min_score: float | None = None,
-    catalog: Catalog | None = None,
+    catalog: Catalog,
 ) -> dict[str, Any]:
-    active_catalog = catalog if catalog is not None else CATALOG
+    active_catalog = catalog
     current = _as_utc(now or utcnow())
     history_by_provider = history_by_provider or {}
     cooldowns = cooldowns or {}

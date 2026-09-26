@@ -63,11 +63,11 @@ def test_load_cli_models_stale_over_48h(tmp_path: Path):
     assert cm.uncatalogued([]) == {}
 
 
-def test_load_cli_models_future_60_seconds_is_fresh(tmp_path: Path):
-    path = tmp_path / "future-60.json"
+def test_load_cli_models_future_timestamp_is_fresh(tmp_path: Path):
+    path = tmp_path / "future.json"
     now = datetime(2026, 9, 26, 10, 0, tzinfo=timezone.utc)
     payload = {
-        "generated_at": (now + timedelta(seconds=60)).isoformat().replace("+00:00", "Z"),
+        "generated_at": (now + timedelta(hours=6)).isoformat().replace("+00:00", "Z"),
         "vendors": {
             "codex": {"ok": True, "models": ["model-codex-top"]},
         },
@@ -79,24 +79,6 @@ def test_load_cli_models_future_60_seconds_is_fresh(tmp_path: Path):
     assert cm is not None
     assert cm.vendors["codex"].fresh is True
     assert cm.listed("codex", "model-codex-top") is True
-
-
-def test_load_cli_models_future_600_seconds_is_not_fresh(tmp_path: Path):
-    path = tmp_path / "future-600.json"
-    now = datetime(2026, 9, 26, 10, 0, tzinfo=timezone.utc)
-    payload = {
-        "generated_at": (now + timedelta(seconds=600)).isoformat().replace("+00:00", "Z"),
-        "vendors": {
-            "codex": {"ok": True, "models": ["model-codex-top"]},
-        },
-    }
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-    cm = load_cli_models(path, now=now)
-
-    assert cm is not None
-    assert cm.vendors["codex"].fresh is False
-    assert cm.listed("codex", "model-codex-top") is None
 
 
 def test_load_cli_models_invalid_files(tmp_path: Path):

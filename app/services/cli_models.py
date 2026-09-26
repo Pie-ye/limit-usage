@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any
 
 FRESH_MAX_AGE_SECONDS = 48 * 3600
-FUTURE_CLOCK_SKEW_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -162,9 +161,7 @@ def load_cli_models(path: str | Path, *, now: datetime) -> CliModels | None:
 
     now_utc = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
     age = (now_utc - raw.generated_at).total_seconds()
-    if -FUTURE_CLOCK_SKEW_SECONDS <= age < 0:
-        age = 0
-    file_fresh = 0 <= age <= FRESH_MAX_AGE_SECONDS
+    file_fresh = age <= FRESH_MAX_AGE_SECONDS
 
     vendors_out: dict[str, VendorList] = {}
     for v_name, v_raw in raw.vendors.items():

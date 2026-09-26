@@ -194,11 +194,12 @@ class _StubRepo:
         return []
 
 
-def _client():
+def _client(catalog: Catalog):
     from app.main import create_app
 
     app: FastAPI = create_app()
     app.router.lifespan_context = _noop_lifespan
+    app.state.catalog = catalog
     app.state.poller = _StubPoller(_all_ok())
     app.state.repository = _StubRepo()
     app.state.routing_feedback = FeedbackRegistry()
@@ -210,9 +211,8 @@ async def _noop_lifespan(app):
     yield
 
 
-def test_feedback_endpoint_round_trip(fake_catalog, monkeypatch):
-    monkeypatch.setattr("app.services.routing_view.CATALOG", fake_catalog)
-    with _client() as c:
+def test_feedback_endpoint_round_trip(fake_catalog):
+    with _client(fake_catalog) as c:
         before = c.get("/api/routing?tier=T2").json()
         assert before["vendor"] == "codex"
 
@@ -325,9 +325,8 @@ def test_registry_404_without_model_cools_pool():
     assert reg.missing_models(now=t0) == {}
 
 
-def test_feedback_endpoint_model_missing_round_trip(fake_catalog, monkeypatch):
-    monkeypatch.setattr("app.services.routing_view.CATALOG", fake_catalog)
-    with _client() as c:
+def test_feedback_endpoint_model_missing_round_trip(fake_catalog):
+    with _client(fake_catalog) as c:
         # Initial feedback state has empty models
         init_state = c.get("/api/routing/feedback").json()
         assert init_state["models"] == {}
